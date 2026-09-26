@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "osm-accessibility-research"
-version = "0.2.0"
+version = "0.3.0"
 description = "Reproducible accessibility-aware pathfinding and diagnostics on OpenStreetMap graphs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = [
   "pymongo>=4.10,<5",
   "matplotlib>=3.9,<4",
   "pyproj>=3.6,<4",
+  "shapely>=2.0,<3",
   "defusedxml>=0.7,<1",
   "ijson>=3.3,<4",
 ]

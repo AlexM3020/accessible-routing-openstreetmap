@@ -15,6 +15,7 @@ from matplotlib.image import imread
 from matplotlib.quiver import Quiver
 from pyproj import CRS, Transformer
 
+from osm_accessibility import visualization as viz
 from osm_accessibility.evaluation import Evaluator
 from osm_accessibility.graph import InMemoryGraph
 from osm_accessibility.models import Coordinate, Edge, Node, Route
@@ -27,6 +28,7 @@ from osm_accessibility.outputs import (
 )
 from osm_accessibility.profiles import CostParameters, Profile
 from osm_accessibility.visualization import (
+    _project_graph,
     _validated_scores,
     create_figures,
     projected_positions,
@@ -233,7 +235,7 @@ def test_four_artifacts_exact_foreground_geometry_scores_and_nonmutation(example
     ]
     presentation = _presentation(route, candidates)
     before_presentation = deepcopy(presentation)
-    positions = projected_positions(graph)
+    positions = _project_graph(graph, route.nodes)[0]
     true = {edge.id: (positions[edge.source], positions[edge.target]) for edge in graph.edges}
     shifted = score_segments(graph, positions)
     original_save = Figure.savefig
@@ -269,7 +271,7 @@ def test_four_artifacts_exact_foreground_geometry_scores_and_nonmutation(example
             assert ax.get_axisbelow()
             assert all(text.get_fontsize() >= 9 for text in [*ax.get_xticklabels(), *ax.get_yticklabels(), *ax.texts])
             if ax.get_label() != "area-context":
-                assert ax.get_position().height > .60
+                assert ax.get_position(original=True).height > .60
         caption = "\n".join(text.get_text() for text in figure.texts)
         assert "Synthetic example" in caption
         assert "not safety guarantees" in caption
@@ -305,18 +307,14 @@ def test_four_artifacts_exact_foreground_geometry_scores_and_nonmutation(example
             assert all(text.get_position()[1] >= 0 and text.get_fontsize() >= 9 for text in _axis(figure, "route-summary").texts)
             inset = _axis(figure, "area-context")
             assert _segments(_collection(inset, "graph-edges")) == [true[e.id] for e in graph.edges]
-            window = next(patch for patch in inset.patches if patch.get_gid() == "focus-window")
-            assert window.get_x() == ax.get_xlim()[0] and window.get_y() == ax.get_ylim()[0]
-            assert window.get_width() == pytest.approx(ax.get_xlim()[1] - ax.get_xlim()[0])
+            assert inset.get_xlim() == ax.get_xlim() and inset.get_ylim() == ax.get_ylim()
         if name == "area_accessibility":
-            assert "offsets ≤1 m" in caption and "not real geometry" in caption
+            assert "150 m route-union corridor" in caption and "Full diagnostics retained" in caption
             left, right = _axis(figure, "area-scores"), _axis(figure, "route-detail")
-            foreground(left, "#c12681")
-            foreground(right, "#182b49")
-            outline = _line(left, "route-outline")
-            assert list(zip(outline.get_xdata(), outline.get_ydata())) == [positions[key] for key in route.nodes]
-            assert _line(left, "route-halo").get_zorder() < outline.get_zorder() < _line(left, "selected-route").get_zorder()
-            assert _line(left, "selected-route").is_dashed()
+            foreground(left, "#1464b4")
+            foreground(right, "#1464b4")
+            assert left.get_xlim() == right.get_xlim() and left.get_ylim() == right.get_ylim()
+            assert not _line(left, "selected-route").is_dashed()
             for ax, prefix, edges, geometry in ((left, "graph", graph.edges, shifted), (right, "path", route.edges, true)):
                 collection = _collection(ax, f"{prefix}-score")
                 active = [edge for edge in edges if not diagnostics[edge.id]["blocked"] and diagnostics[edge.id]["score"] is not None]
@@ -494,36 +492,40 @@ def test_actual_presentation_filter_respected_without_supplementing_pois_or_conf
     assert (presentation, diagnostics) == before
 
 
-def test_route_focus_excludes_disconnected_extent_but_inset_and_area_keep_every_edge(example, tmp_path, monkeypatch):
+def test_all_maps_exclude_disconnected_island_but_keep_full_diagnostics(example, tmp_path, monkeypatch):
     original, route, diagnostics, pois = example
     far_a, far_b = Node("far-a", Coordinate(49.7, 11.1)), Node("far-b", Coordinate(49.71, 11.1))
     far_edge = Edge("far-edge", far_a.id, far_b.id, "far-way", _distance(far_a, far_b))
     graph = InMemoryGraph([*original.nodes.values(), far_a, far_b], [*original.edges, far_edge])
     diagnostics[far_edge.id] = {"score": 50., "blocked": False}
-    positions = projected_positions(graph)
+    positions = _project_graph(graph, route.nodes)[0]
     candidates = [_candidate("near"), _candidate("far", latitude=49.705, longitude=11.1)]
     presentation = _presentation(route, candidates, limit=1)
     selected, counts, extent = select_map_obstacles(graph, route, pois, presentation=presentation)
     assert [row["id"] for row in selected] == ["near"] and counts["cropped"] == 1
-    assert extent[1] - extent[0] < 500 and extent[3] - extent[2] < 500
+    assert extent[1] - extent[0] < 700 and extent[3] - extent[2] < 700
+    before = deepcopy(diagnostics)
 
     def inspect(figure, destination, **kwargs):
         if Path(destination.name).stem == "route_obstacles":
             focus = _axis(figure, "route-focus")
             assert (*focus.get_xlim(), *focus.get_ylim()) == extent
-            assert len(_collection(focus, "graph-edges").get_segments()) == len(graph.edges)
+            assert len(_collection(focus, "graph-edges").get_segments()) == len(original.edges)
             full = _axis(figure, "area-context")
         else:
             full = _axis(figure, "area-scores")
             assert sum(len(artist.get_segments()) for artist in full.collections
-                       if isinstance(artist, LineCollection)) == len(graph.edges)
-        for x, y in positions.values():
-            assert full.get_xlim()[0] < x < full.get_xlim()[1]
-            assert full.get_ylim()[0] < y < full.get_ylim()[1]
+                       if isinstance(artist, LineCollection)) == len(original.edges)
+        assert full.get_xlim() == extent[:2] and full.get_ylim() == extent[2:]
+        for node in (far_a, far_b):
+            x, y = positions[node.id]
+            assert not (full.get_xlim()[0] < x < full.get_xlim()[1]
+                        and full.get_ylim()[0] < y < full.get_ylim()[1])
 
     monkeypatch.setattr(Figure, "savefig", inspect)
     create_figures(graph, route, diagnostics, pois, presentation=presentation, title="Disconnected context",
                    synthetic=True, output_dir=tmp_path)
+    assert diagnostics == before and far_edge.id in diagnostics
 
 
 def test_unknown_candidates_are_suppressed_not_drawn_as_obstacles(example, tmp_path, monkeypatch):
@@ -567,7 +569,7 @@ def test_only_sparse_route_arrows_and_all_segments_retained(tmp_path, monkeypatc
     distance = sum(edge.distance_m for edge in edges)
     route = Route(tuple(node.id for node in nodes), tuple(edges), distance, distance)
     diagnostics = {edge.id: {"score": 40 + i % 10, "blocked": False} for i, edge in enumerate(edges)}
-    positions = projected_positions(graph)
+    positions = _project_graph(graph, route.nodes)[0]
     sampled = edges[::7]  # ceil(40/6); at most six arrows, not forty city-edge arrows.
 
     def inspect(figure, destination, **kwargs):
@@ -587,6 +589,102 @@ def test_only_sparse_route_arrows_and_all_segments_retained(tmp_path, monkeypatc
 
     monkeypatch.setattr(Figure, "savefig", inspect)
     create_figures(graph, route, diagnostics, [], title="Long path", synthetic=True, output_dir=tmp_path)
+
+
+@pytest.mark.parametrize("vertical", [False, True])
+def test_two_km_corridor_renderer_readable_equal_scale_layout(tmp_path, monkeypatch, vertical):
+    local = CRS.from_proj4("+proj=aeqd +lat_0=49.59 +lon_0=11 +datum=WGS84 +units=m +no_defs")
+    inverse = Transformer.from_crs(local, "EPSG:4326", always_xy=True)
+    xy = {f"{x},{y}": (50. * x, 50. * y) for x in range(41) for y in range(-4, 5)}
+    xy.update({"island-a": (9000., 9000.), "island-b": (9100., 9000.)})
+    nodes = []
+    for key, point in xy.items():
+        lon, lat = inverse.transform(*(point[::-1] if vertical else point))
+        nodes.append(Node(key, Coordinate(lat, lon)))
+    edges = []
+    for x in range(41):
+        for y in range(-4, 5):
+            a = f"{x},{y}"
+            for b in (f"{x + 1},{y}", f"{x},{y + 1}"):
+                if b in xy:
+                    edges.extend(Edge(f"{s}>{t}", s, t, "grid", 50., {"highway": "footway"})
+                                 for s, t in ((a, b), (b, a)))
+    edges.append(Edge("island", "island-a", "island-b", "island", 100.))
+    graph = InMemoryGraph(nodes, edges)
+    by_id = {edge.id: edge for edge in edges}
+
+    def trace(keys):
+        path = tuple(by_id[f"{a}>{b}"] for a, b in zip(keys, keys[1:]))
+        return Route(tuple(keys), path, len(path) * 50., len(path) * 50.)
+
+    standard = trace([f"{x},0" for x in range(41)])
+    route = trace(["0,0", *[f"{x},1" for x in range(41)], "40,0"])
+    diagnostics = {edge.id: {"score": 100., "blocked": edge.id == "20,0>21,0"} for edge in edges}
+    before = repr(graph.nodes), repr(graph.edges), repr(route), repr(standard), deepcopy(diagnostics)
+    positions, _ = viz._project_graph(graph, [*route.nodes, *standard.nodes])
+    paths = [[positions[key] for key in item.nodes] for item in (route, standard)]
+    corridor = viz._corridor(graph, positions, paths, 150.)
+    nearby = InMemoryGraph(nodes[:-2], edges[:-1])
+    near_positions, _ = viz._project_graph(nearby, [*route.nodes, *standard.nodes])
+    assert corridor.extent == viz._corridor(nearby, near_positions, paths, 150.).extent
+    assert "island" not in corridor.segments
+    assert min(corridor.extent[1] - corridor.extent[0], corridor.extent[3] - corridor.extent[2]) < 600
+    seen = []
+
+    def inspect(figure, destination, **kwargs):
+        seen.append(Path(destination.name).stem)
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        if seen[-1] == "route_obstacles":
+            ax = _axis(figure, "route-focus")
+            assert (*ax.get_xlim(), *ax.get_ylim()) == corridor.extent
+            assert ax.get_position().y1 == pytest.approx(ax.get_position(original=True).y1)
+            assert ax.get_anchor() == "N"
+            for gid, expected in (("selected-route", paths[0]), ("standard-route", paths[1])):
+                line = _line(ax, gid)
+                assert list(zip(line.get_xdata(), line.get_ydata())) == expected
+            return
+        selected, baseline = _axis(figure, "area-scores"), _axis(figure, "route-detail")
+        a, b = selected.get_position(), baseline.get_position()
+        assert a.width == pytest.approx(b.width) and a.height == pytest.approx(b.height)
+        if vertical:
+            assert a.x1 < b.x0 and a.y0 == pytest.approx(b.y0)
+        else:
+            assert a.y0 > b.y1 and a.x0 == pytest.approx(b.x0)
+            assert a.width > .85  # More than twice the former .40-wide side-by-side pane.
+            assert figure.get_size_inches()[1] < 10
+        scales = []
+        for ax, gid, expected in ((selected, "selected-route", paths[0]), (baseline, "standard-route", paths[1])):
+            assert (*ax.get_xlim(), *ax.get_ylim()) == corridor.extent
+            assert ax.get_aspect() == 1 and ax.get_adjustable() == "box"
+            origin, east, north = ax.transData.transform([(0, 0), (1, 0), (0, 1)])
+            scale_x, scale_y = east[0] - origin[0], north[1] - origin[1]
+            assert scale_x == pytest.approx(scale_y)
+            assert east[1] == origin[1] and north[0] == origin[0]  # No rotation/shear.
+            scales.append(scale_x)
+            line = _line(ax, gid)
+            assert list(zip(line.get_xdata(), line.get_ydata())) == expected  # No invented connectors.
+            for suffix in ("score", "blocked"):
+                assert max(_collection(ax, "graph-" + suffix).get_linewidths()) <= 1.
+            # Neither the distance of an island nor the score offset expands the original buffer.
+            assert all(corridor.geometry.buffer(1e-7).covers(viz.LineString(segment))
+                       for segment in _collection(ax, "graph-score").get_segments())
+        assert scales[0] == pytest.approx(scales[1])
+        assert _line(selected, "selected-route").get_linewidth() == 6
+        assert max(_collection(selected, "path-score").get_linewidths()) == 3.2
+        # Renderer-space bounds include tick labels, axis labels and pane titles.
+        boxes = [ax.get_tightbbox(renderer) for ax in (selected, baseline, _axis(figure, "edge-score-scale"))]
+        boxes += [text.get_window_extent(renderer) for text in figure.texts]
+        boxes += [legend.get_window_extent(renderer) for legend in figure.legends]
+        for index, box in enumerate(boxes):
+            assert figure.bbox.contains(box.x0, box.y0) and figure.bbox.contains(box.x1, box.y1)
+            assert all(not box.overlaps(previous) for previous in boxes[:index])
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    create_figures(graph, route, diagnostics, [], standard_route=standard, corridor_radius_m=150.,
+                   title="Two kilometre grid", synthetic=True, output_dir=tmp_path)
+    assert seen == ["route_obstacles", "area_accessibility"]
+    assert (repr(graph.nodes), repr(graph.edges), repr(route), repr(standard), diagnostics) == before
 
 
 def test_supplied_failed_checks_remain_visible_and_synthetic_flag_cannot_be_hidden(example, tmp_path, monkeypatch):

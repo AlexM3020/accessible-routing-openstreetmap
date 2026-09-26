@@ -32,7 +32,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--snap-distance", type=float, default=150)
         command.add_argument("--algorithm", choices=("astar", "dijkstra"), default="astar")
         command.add_argument("--no-plots", action="store_true")
-        command.add_argument("--no-baselines", action="store_true")
+        command.add_argument("--no-baselines", action="store_true", help="Skip numerical oracle checks; retain the standard-route comparison")
         command.add_argument("--format", choices=("png", "pdf", "both"), default="png")
         command.add_argument("--details", action="store_true", help="Also expand raw CSV/JSON evidence into diagnostics/")
         command.add_argument("--json", action="store_true", help="Print full run metadata instead of a brief summary")
@@ -65,6 +65,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _presentation_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--corridor-radius", type=float, default=None, metavar="METRES",
+                         help="Map buffer around both routes, default 150 m (0 < radius <= 5000); does not restrict routing")
     command.add_argument("--obstacles", nargs="+", choices=("auto", "all", "none", *OBSTACLE_KINDS),
                          help="Marker types only, e.g. stairs barrier kerb; auto is important/preference-relevant features")
     command.add_argument("--max-markers", type=int, default=None, help="Map marker budget, default 12 (0-100); complete report is never truncated")
@@ -102,6 +104,23 @@ def _print_result(manifest: dict, output: Path) -> None:
     coverage = "not defined" if metrics["coverage_percent"] is None else f"{metrics['coverage_percent']:.1f}%"
     print("SYNTHETIC EXAMPLE — not observed map conditions" if view["synthetic"] else "Route result — based on recorded map data")
     print(f"Profile: {view['profile_name']} | Distance: {metrics['distance_m']:.1f} m | Match: {score} | Coverage: {coverage}")
+    paired = view.get("comparison")
+    if paired:
+        baseline = paired["standard"]
+        print(f"Standard no-preference route: {baseline['distance_m']:.1f} m; "
+              f"selected distance change {paired['distance_difference_m']:+.1f} m")
+        print("Obstacle encounters              Selected  Standard  Change")
+        for row in paired["obstacle_rows"]:
+            if row["selected"] or row["standard"]:
+                print(f"  {row['label']:<29} {row['selected']:>6} {row['standard']:>9} {row['difference']:>+7}")
+        print(f"Known preference conflicts: {paired['selected']['conflict_count']} selected / "
+              f"{baseline['conflict_count']} standard; missing observations: "
+              f"{paired['selected']['unknown_count']} / {baseline['unknown_count']}.")
+        if baseline["hard_block_violations"]:
+            print("STANDARD ROUTE INFEASIBLE under selected hard requirements; not a recommended alternative.")
+        if paired["same_path"]:
+            print("Same path: preferences did not change the selected directed route.")
+        print("Both paths assessed under your profile; counts are grouped encounters, not unique physical obstacles.")
     selected = "; ".join(f"{item['label']} ({item['weight']:g})" for item in view["selected_preferences"])
     print("Selected preferences: " + (selected or "none"))
     print(f"Known preference conflicts: {len(view['conflicts'])}; unknown observations: {len(view['unknowns'])}")
@@ -143,7 +162,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2))
             return 0
         if args.command == "plot":
-            paths = replot(args.run, args.output, formats, presentation_overrides=_presentation_overrides(args))
+            paths = replot(args.run, args.output, formats, presentation_overrides=_presentation_overrides(args),
+                           corridor_radius_m=args.corridor_radius)
             print(f"Saved {len(paths)} maps and route_summary.md to {args.output}")
             return 0
         if args.command == "sweep":
@@ -166,7 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest = run_experiment(dataset, start, end, profile, parameters, args.output,
                                   algorithm=args.algorithm, snap_distance_m=args.snap_distance,
                                   plots=not args.no_plots, baselines=not args.no_baselines, file_formats=formats,
-                                  presentation_options=_presentation_options(args), detailed=args.details)
+                                  presentation_options=_presentation_options(args), detailed=args.details,
+                                  corridor_radius_m=150.0 if args.corridor_radius is None else args.corridor_radius)
         if args.json:
             print(json.dumps(manifest, indent=2))
         else:

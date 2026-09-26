@@ -592,7 +592,8 @@ def _finish_obstacle(graph: InMemoryGraph, group: dict, diagnostics: dict[str, d
 
 
 def _obstacle_candidates(graph: InMemoryGraph, route: Route, diagnostics: dict[str, dict],
-                         profile: Profile, parameters: CostParameters) -> list[dict]:
+                         profile: Profile, parameters: CostParameters, *,
+                         include_context: bool = True) -> list[dict]:
     groups: list[dict] = []
     previous: dict[tuple, dict] = {}
     for segment, edge in enumerate(route.edges, 1):
@@ -626,6 +627,9 @@ def _obstacle_candidates(graph: InMemoryGraph, route: Route, diagnostics: dict[s
                 previous[key] = group
                 groups.append(group)
             _include_feature(group, feature, incident, [], segment, visit)
+
+    if not include_context:
+        return _finish_candidates(graph, groups, diagnostics)
 
     # Do not turn a blocked reciprocal of a selected segment into an on-route
     # violation or a second obstacle. Context covers only untraversed geometry.
@@ -673,6 +677,11 @@ def _obstacle_candidates(graph: InMemoryGraph, route: Route, diagnostics: dict[s
                     node_groups[kind] = _new_obstacle(kind, None, node.id, False, tags.get("name"))
                     groups.append(node_groups[kind])
                 _include_feature(node_groups[kind], feature, incident if not node_groups[kind]["_edges"] else [], [])
+    return _finish_candidates(graph, groups, diagnostics)
+
+
+def _finish_candidates(graph: InMemoryGraph, groups: list[dict],
+                       diagnostics: dict[str, dict]) -> list[dict]:
     candidates = [_finish_obstacle(graph, group, diagnostics) for group in groups]
     return sorted(candidates, key=lambda row: (
         not row["on_route"], {"blocked": 0, "conflict": 1, "encountered": 2, "context": 3}[row["status"]],
@@ -700,6 +709,7 @@ def build_route_presentation(
     graph: InMemoryGraph, route: Route, diagnostics: dict[str, dict], profile: Profile,
     parameters: CostParameters, *, options: PresentationOptions | None = None,
     baselines: dict | None = None, snapping: dict | None = None, synthetic: bool = False,
+    include_context: bool = True,
 ) -> dict:
     """Build a complete, output-only view; never reroute or reevaluate the graph.
 
@@ -720,6 +730,8 @@ def build_route_presentation(
     map_obstacles is sorted but NOT capped: the drawing consumer applies max_markers.
     selected_kinds=None means automatic important/selected-adverse markers; a tuple
     is solely a type filter over known features, not an additional relevance filter.
+    include_context=False skips off-route edge/node feature analysis, preserving
+    all on-route records and markers. Complete graph diagnostics are still required.
     """
     if options is None:
         options = PresentationOptions()
@@ -739,7 +751,8 @@ def build_route_presentation(
     )
     known = sum(float(record["known_exposure_m"]) for record in records)
     conflicts, unknowns = _route_issues(route, diagnostics, profile, parameters)
-    candidates = _obstacle_candidates(graph, route, diagnostics, profile, parameters)
+    candidates = _obstacle_candidates(graph, route, diagnostics, profile, parameters,
+                                      include_context=include_context)
     selected = [row for row in candidates if (
         row["_automatic"] if options.obstacle_kinds is None else row["kind"] in options.obstacle_kinds
     )]
@@ -808,6 +821,104 @@ def build_route_presentation(
     }
 
 
+def build_route_comparison(
+    graph: InMemoryGraph, selected_route: Route, standard_route: Route,
+    diagnostics: dict[str, dict], profile: Profile, parameters: CostParameters, *,
+    selected_presentation: dict | None = None,
+) -> dict:
+    """Compare supplied traces without searching or changing the evaluator.
+
+    Both routes' diagnostics MUST come from the selected profile/parameters.
+    The caller supplies a distance-only standard route found with no soft weights,
+    wheelchair_required=False and prefer_handrail=False at the same snapped nodes.
+    Its shortest-path provenance is the caller's responsibility, not verified here.
+    A supplied selected presentation must describe these same inputs; only its
+    full route records are copied, never marker selections or a nested comparison.
+    Search costs are deliberately not compared/exported: their objectives differ,
+    and a blocked trace has no feasible selected-profile optimized cost or score.
+    """
+    if (selected_route.nodes[0], selected_route.nodes[-1]) != (
+        standard_route.nodes[0], standard_route.nodes[-1]
+    ):
+        raise DataError("Route comparison requires the same snapped endpoints in the same direction")
+
+    def stats(route: Route, view: dict | None = None) -> dict:
+        if view is None:
+            view = build_route_presentation(graph, route, diagnostics, profile, parameters,
+                                            include_context=False)
+        records = [diagnostics[edge.id] for edge in route.edges]
+        blocked = sum(record["blocked"] is True for record in records)
+        # Pool selected-profile diagnostics, never the standard search's cost or
+        # score and never averages of edge scores. Repeated traversals count again.
+        exposure = sum(float(record["exposure_m"]) for record in records)
+        risk = sum(float(record["way_risk_metres"]) + float(record["event_risk_metres"])
+                   for record in records)
+        known = sum(float(record["known_exposure_m"]) for record in records)
+        obstacles = deepcopy(view["encountered_obstacles"])
+        conflicts, unknowns = deepcopy(view["conflicts"]), deepcopy(view["unknowns"])
+        counts = {kind: sum(row["kind"] == kind for row in obstacles) for kind in OBSTACLE_KINDS}
+        return {
+            "distance_m": float(route.distance_m),
+            "score_percent": (100 * max(0.0, min(1.0, 1 - risk / exposure))
+                              if exposure > 0 and not blocked else None),
+            "coverage_percent": 100 * min(1.0, max(0.0, known / exposure)) if exposure else None,
+            "hard_block_violations": blocked, "conflict_count": len(conflicts),
+            "unknown_count": len(unknowns), "encounter_count": len(obstacles),
+            "obstacle_counts": counts, "obstacles": obstacles, "conflicts": conflicts, "unknowns": unknowns,
+        }
+
+    selected = stats(selected_route, selected_presentation)
+    standard = stats(standard_route)
+    distance_difference = selected["distance_m"] - standard["distance_m"]
+    selected_score, standard_score = selected["score_percent"], standard["score_percent"]
+    limitations = [
+        "Both routes are assessed using the same selected-profile observations, weights, risk, "
+        "event exposure and missing-data rule. Profile match is a model summary, not a safety probability; "
+        "score changes are percentage points, not percent overall accessibility improvement.",
+        "Counts are grouped encounters by type, not stair risers or unique physical objects. "
+        "Contiguous way encounters and node visits are grouped; nonconsecutive revisits count again. "
+        "The same physical feature may count in multiple type rows. Counts can change with OSM "
+        "way segmentation; they are not globally invariant under resegmentation.",
+        "Known selected soft conflicts and missing information are reported separately. Unknown data "
+        "are not observed obstacles, even when assigned risk. Zero tagged stairs is not proof of no stairs; "
+        "only recorded features are visible and neither route is field-verified.",
+        "A route violating selected hard requirements is infeasible under those requirements, not a "
+        "valid scored alternative: its profile-match score and comparable optimized cost are unavailable. "
+        "The standard path is not recommended if it violates selected requirements.",
+        "The no-preference baseline differs from the distance-only baseline under matched hard constraints. "
+        "It does not replace matched-constraint distance overhead or A*/Dijkstra optimality validation. "
+        "Search costs from different objectives are not compared.",
+        "Distances cover the same snapped graph endpoints, not unverified connections to requested "
+        "locations. Signed changes are selected minus standard and may show trade-offs in either direction.",
+        "No selected soft preferences means no preference-match score, not 100% accessibility.",
+    ]
+    if profile.wheelchair_required:
+        limitations.append(
+            "The standard search disables the selected wheelchair hard requirement. Differences may "
+            "therefore reflect that changed feasibility constraint, not just soft-preference optimization."
+        )
+    return {
+        "status": "available", "same_endpoints": True,
+        "same_path": tuple(edge.id for edge in selected_route.edges) == tuple(edge.id for edge in standard_route.edges),
+        "definition": "Standard route: supplied shortest pedestrian route by mapped distance between the "
+                      "same snapped endpoints, with no soft preferences, no wheelchair hard requirement "
+                      "and no handrail preference. Basic pedestrian, access and directional hard rules "
+                      "remain enforced. Both routes are assessed here under the selected profile.",
+        "selected": selected, "standard": standard,
+        "obstacle_rows": [{"kind": kind, "label": OBSTACLE_LABELS[kind],
+                           "selected": selected["obstacle_counts"][kind],
+                           "standard": standard["obstacle_counts"][kind],
+                           "difference": selected["obstacle_counts"][kind] - standard["obstacle_counts"][kind]}
+                          for kind in OBSTACLE_KINDS],
+        "distance_difference_m": distance_difference,
+        "distance_difference_percent": (100 * distance_difference / standard["distance_m"]
+                                        if standard["distance_m"] else None),
+        "score_difference_pp": (selected_score - standard_score
+                                if selected_score is not None and standard_score is not None else None),
+        "limitations": limitations,
+    }
+
+
 def _markdown_text(value: object) -> str:
     """Make untrusted OSM/profile text a single literal Markdown cell/inline span."""
     text = " ".join(str(value).split())
@@ -828,6 +939,75 @@ def _issue_table(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _comparison_table(comparison: dict, *, no_preferences: bool) -> list[str]:
+    selected, standard = comparison["selected"], comparison["standard"]
+
+    def percent(value: float | None) -> str:
+        return "not available" if value is None else f"{value:.1f}%"
+
+    def match(stats: dict) -> str:
+        return ("infeasible under selected requirements" if stats["hard_block_violations"]
+                else percent(stats["score_percent"]))
+
+    distance_change = f"{comparison['distance_difference_m']:+.1f} m"
+    distance_percent = comparison["distance_difference_percent"]
+    distance_change += (f" ({distance_percent:+.1f}%)" if distance_percent is not None
+                        else " (percentage not defined: zero standard distance)")
+    score_change = comparison["score_difference_pp"]
+    coverage_change = (selected["coverage_percent"] - standard["coverage_percent"]
+                       if selected["coverage_percent"] is not None and standard["coverage_percent"] is not None
+                       else None)
+    lines = ["## Selected vs no-preference shortest pedestrian route", "",
+             _markdown_text(comparison["definition"]), "",
+             "Changes are selected minus standard; fewer obstacles can coexist with worse conditions of another type.", "",
+             "| Measure | Selected route | Standard route | Change |",
+             "| --- | --- | --- | --- |",
+             f"| Distance | {selected['distance_m']:.1f} m | {standard['distance_m']:.1f} m | {distance_change} |",
+             f"| Profile match | {match(selected)} | {match(standard)} | "
+             + ("not available" if score_change is None else f"{score_change:+.1f} pp") + " |",
+             f"| Data coverage | {percent(selected['coverage_percent'])} | {percent(standard['coverage_percent'])} | "
+             + ("not available" if coverage_change is None else f"{coverage_change:+.1f} pp") + " |"]
+    for label, key in (("Known selected soft conflicts", "conflict_count"),
+                       ("Unknowns (missing information)", "unknown_count"),
+                       ("Blocked directed traversals", "hard_block_violations")):
+        lines.append(f"| {label} | {selected[key]} | {standard[key]} | {selected[key] - standard[key]:+d} |")
+    for row in comparison["obstacle_rows"]:
+        if row["selected"] or row["standard"]:
+            lines.append(f"| {_markdown_text(row['label'])} encounters | {row['selected']} | "
+                         f"{row['standard']} | {row['difference']:+d} |")
+    if comparison["same_path"]:
+        lines.extend(["", "**Same path:** both routes use the exact same directed edge sequence."])
+    if no_preferences:
+        lines.extend(["", "**No selected soft preferences:** profile match is unavailable, not 100% accessibility."])
+    if standard["hard_block_violations"]:
+        lines.extend(["", "**The standard path is not recommended:** it violates selected hard requirements."])
+    return lines
+
+
+def _standard_route_details(comparison: dict) -> list[str]:
+    standard = comparison["standard"]
+    lines = ["", "## Standard route — full selected-profile assessment", "",
+             "These are all grouped records, independent of marker filters and limits.", "",
+             f"### Encountered obstacles ({standard['encounter_count']} grouped encounters)", ""]
+    if standard["obstacles"]:
+        lines.extend(["| Type | Location | Extent | Status | Selected preferences | Observation |",
+                      "| --- | --- | --- | --- | --- | --- |"])
+        for row in standard["obstacles"]:
+            extent = "Node encounter" if row["node_id"] is not None else f"{row['distance_m']:.1f} m"
+            cells = [row["label"], row["location"], extent, row["classification"],
+                     "; ".join(row["preference_labels"]) or "None", row["description"]]
+            lines.append("| " + " | ".join(_markdown_text(cell) for cell in cells) + " |")
+    else:
+        lines.append("No known adverse encounters identified; this is not evidence of an obstacle-free route.")
+    lines.extend(["", f"### Known selected soft conflicts ({standard['conflict_count']} grouped entries)", ""])
+    lines.extend(_issue_table(standard["conflicts"]))
+    lines.extend(["", f"### Missing data ({standard['unknown_count']} grouped entries)", ""])
+    lines.extend(_issue_table(standard["unknowns"]))
+    lines.extend(["", "### Comparison limitations", ""])
+    lines.extend("- " + _markdown_text(item) for item in comparison["limitations"])
+    return lines
+
+
 def render_route_summary(presentation: dict) -> str:
     """Human-first Markdown of the full route, never the marker-limited subset."""
     metrics = presentation["metrics"]
@@ -835,13 +1015,22 @@ def render_route_summary(presentation: dict) -> str:
         f"{metrics['score_percent']:.1f}%"
     )
     coverage = "not available" if metrics["coverage_percent"] is None else f"{metrics['coverage_percent']:.1f}%"
+    comparison = presentation.get("comparison")
+    cost = f"{metrics['cost_m']:.1f} m"
+    if comparison is not None and comparison["selected"]["hard_block_violations"]:
+        score = "infeasible under selected requirements"
+        cost = "not available (infeasible under selected requirements)"
     data = ("Synthetic example — not observed OpenStreetMap conditions." if presentation["synthetic"] else
             "Real-data run (OpenStreetMap input, not flagged synthetic) — not field-verified.")
     lines = [f"# Route summary — {_markdown_text(presentation['profile_name'])}", "", data, "",
              f"**Distance:** {metrics['distance_m']:.1f} m · **Preference match:** {score} · "
-             f"**Data coverage:** {coverage} · **Optimized cost:** {metrics['cost_m']:.1f} m", "",
+             f"**Data coverage:** {coverage} · **Optimized cost:** {cost}", "",
              "Match and coverage pool the supplied risk/exposure diagnostics, not averages of edge scores. "
-             "They are model summaries, not safety probabilities.", "", "## Selected preferences", ""]
+             "They are model summaries, not safety probabilities.", ""]
+    if comparison is not None:
+        lines.extend(_comparison_table(comparison, no_preferences=not presentation["selected_preferences"]))
+        lines.append("")
+    lines.extend(["## Selected preferences", ""])
     for preference in presentation["selected_preferences"]:
         lines.append(f"- {_markdown_text(preference['label'])}: weight {preference['weight']:g} "
                      f"(**{_markdown_text(preference['importance'])}**).")
@@ -868,6 +1057,8 @@ def render_route_summary(presentation: dict) -> str:
                   "Unknown data are not observed obstacles or hard violations. They remain here even when "
                   "the configured unknown risk is zero; they still reduce data coverage.", ""])
     lines.extend(_issue_table(presentation["unknowns"]))
+    if comparison is not None:
+        lines.extend(_standard_route_details(comparison))
     validation = presentation["validation"]
     lines.extend(["", "## Validation and limitations", "",
                   f"- Hard-constraint violations on selected directed edges: {validation['hard_constraint_violations']}."])

@@ -20,7 +20,7 @@ from osm_accessibility.experiment import (
 )
 from osm_accessibility.models import Coordinate
 from osm_accessibility.outputs import PresentationOptions
-from osm_accessibility.profiles import CostParameters, wheelchair_profile
+from osm_accessibility.profiles import CostParameters, Profile, wheelchair_profile
 
 
 def run(dataset, output, **kwargs):
@@ -296,3 +296,148 @@ def test_cli_demo_and_error_handling(tmp_path, capsys):
     assert main(["query", "--bbox", "49.57", "10.995", "49.61", "11.025"]) == 0
     assert ">>" in capsys.readouterr().out
     assert main(["query", "--bbox", "49.61", "10.995", "49.57", "11.025"]) == 1
+
+
+def test_standard_comparison_same_endpoints_and_selected_profile_assessment(dataset, tmp_path):
+    directory = tmp_path / "paired"
+    result = run(dataset, directory, plots=False, corridor_radius_m=75)
+    assert result["format_version"] == 3
+    assert result["standard_route"]["objective"] == "distance_only"
+    standard = result["standard_route"]["route"]
+    assert standard["node_ids"] == ["s", "stairs_mid", "t"]
+    assert standard["node_ids"][::len(standard["node_ids"]) - 1] == [
+        result["route"]["node_ids"][0], result["route"]["node_ids"][-1],
+    ]
+    assert standard["optimized_cost_m"] == standard["distance_m"]
+    assert standard["score_percent"] is None
+    assert not result["standard_route"]["profile"]["wheelchair_required"]
+    assert not any(result["standard_route"]["profile"]["weights"].values())
+    compared = result["presentation"]["comparison"]
+    assert compared["selected"]["obstacle_counts"]["stairs"] == 0
+    assert compared["standard"]["obstacle_counts"]["stairs"] == 1
+    assert compared["standard"]["hard_block_violations"] == 2
+    assert compared["standard"]["score_percent"] is None
+    assert compared["score_difference_pp"] is None
+    assert compared["standard"]["unknown_count"] > 0
+    assert result["output"]["corridor_radius_m"] == 75
+    assert result["baselines"]["distance_only_same_constraints"]["distance_m"] > standard["distance_m"]
+    load_run(directory)
+    load_run(directory / ARCHIVE_NAME)
+
+
+def test_no_baselines_still_generates_standard_comparison(dataset, tmp_path):
+    result = run(dataset, tmp_path / "no-oracles", plots=False, baselines=False)
+    assert result["baselines"] == {}
+    assert result["presentation"]["validation"]["astar_dijkstra_agree"] is None
+    assert result["presentation"]["comparison"]["status"] == "available"
+
+
+def test_no_preferences_same_path_is_not_perfect_accessibility(dataset, tmp_path):
+    result = run_experiment(dataset, Coordinate(49.58, 11), Coordinate(49.58, 11.002),
+                            Profile(name="No preferences", prefer_handrail=False), CostParameters(),
+                            tmp_path / "unweighted", plots=False)
+    comparison = result["presentation"]["comparison"]
+    assert comparison["same_path"]
+    assert comparison["selected"] == comparison["standard"]
+    assert comparison["selected"]["score_percent"] is None
+    assert all(row["difference"] == 0 for row in comparison["obstacle_rows"])
+
+
+@pytest.mark.parametrize("radius", [0, -1, 5001, True, float("nan"), float("inf")])
+def test_invalid_corridor_rejected_before_creating_output(dataset, tmp_path, radius):
+    output = tmp_path / "invalid"
+    with pytest.raises(DataError, match="corridor_radius_m"):
+        run(dataset, output, plots=False, corridor_radius_m=radius)
+    assert not output.exists()
+
+
+def test_display_controls_do_not_change_either_trace_or_comparison(dataset, tmp_path):
+    first = run(dataset, tmp_path / "one", plots=False, corridor_radius_m=25)
+    second = run(dataset, tmp_path / "two", plots=False, corridor_radius_m=500,
+                 presentation_options=PresentationOptions((), 0))
+    assert first["presentation"]["comparison"] == second["presentation"]["comparison"]
+    for key in ("node_ids", "edge_ids", "distance_m", "optimized_cost_m", "score_percent"):
+        assert first["route"][key] == second["route"][key]
+        assert first["standard_route"]["route"][key] == second["standard_route"]["route"][key]
+
+
+@pytest.mark.parametrize("corruption", ["profile", "objective", "cost", "path", "comparison", "radius"])
+def test_standard_comparison_corruption_is_detected(dataset, tmp_path, corruption):
+    output = tmp_path / "source"
+    run(dataset, output, plots=False)
+
+    def corrupt(contents):
+        manifest = json.loads(contents["manifest.json"])
+        standard = manifest["standard_route"]
+        if corruption == "profile":
+            standard["profile"]["wheelchair_required"] = True
+        elif corruption == "objective":
+            standard["objective"] = "preferences"
+        elif corruption == "cost":
+            standard["route"]["optimized_cost_m"] += 10
+        elif corruption == "path":
+            standard["route"]["edge_ids"].reverse()
+        elif corruption == "radius":
+            manifest["output"]["corridor_radius_m"] = -2
+        else:
+            # Rewrite both stored copies and their hash: the semantic comparison
+            # check must detect a false count even when byte checksums agree.
+            import hashlib
+            manifest["presentation"]["comparison"]["standard"]["obstacle_counts"]["stairs"] = 0
+            contents["presentation.json"] = json.dumps(manifest["presentation"]).encode()
+            manifest["artifact_sha256"]["presentation.json"] = hashlib.sha256(contents["presentation.json"]).hexdigest()
+        contents["manifest.json"] = json.dumps(manifest).encode()
+
+    alter_archive(output, corrupt)
+    with pytest.raises(DataError):
+        load_run(output)
+
+
+def test_replot_uses_recorded_standard_without_search_and_inherits_radius(dataset, tmp_path, monkeypatch):
+    import osm_accessibility.experiment as experiment
+    import osm_accessibility.visualization as visualization
+
+    source = tmp_path / "source"
+    saved = run(dataset, source, plots=False, corridor_radius_m=85)
+    captured = []
+    real_figures = visualization.create_figures
+
+    def observe(*args, **kwargs):
+        captured.append((kwargs["standard_route"], kwargs["corridor_radius_m"], kwargs["presentation"]))
+        return real_figures(*args, **kwargs)
+
+    def no_search(*args, **kwargs):
+        pytest.fail("Replot must not reroute a recorded comparison")
+
+    monkeypatch.setattr(experiment, "find_route", no_search)
+    monkeypatch.setattr(visualization, "create_figures", observe)
+    replot(source, tmp_path / "inherited")
+    replot(source, tmp_path / "override", corridor_radius_m=30)
+    assert [row[1] for row in captured] == [85, 30]
+    assert list(captured[0][0].nodes) == saved["standard_route"]["route"]["node_ids"]
+    assert captured[0][2]["comparison"] == captured[1][2]["comparison"]
+    assert read_manifest(source) == saved
+
+
+def test_version_two_archive_replots_without_inventing_a_standard_route(dataset, tmp_path, monkeypatch):
+    import hashlib
+
+    import osm_accessibility.experiment as experiment
+
+    source = tmp_path / "old"
+    run(dataset, source, plots=False)
+
+    def old_format(contents):
+        manifest = json.loads(contents["manifest.json"])
+        manifest["format_version"] = 2
+        manifest.pop("standard_route")
+        manifest["presentation"].pop("comparison")
+        contents["presentation.json"] = json.dumps(manifest["presentation"]).encode()
+        manifest["artifact_sha256"]["presentation.json"] = hashlib.sha256(contents["presentation.json"]).hexdigest()
+        contents["manifest.json"] = json.dumps(manifest).encode()
+
+    alter_archive(source, old_format)
+    monkeypatch.setattr(experiment, "find_route", lambda *args, **kwargs: pytest.fail("No invented old baseline"))
+    replot(source, tmp_path / "old-figures")
+    text = (tmp_path / "old-figures" / "route_summary.md").read_text(encoding="utf-8")
+    assert "Selected vs no-preference shortest pedestrian route" not in text

@@ -11,6 +11,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from osm_accessibility import outputs
 from osm_accessibility.builder import build_graph
 from osm_accessibility.errors import DataError
 from osm_accessibility.evaluation import Evaluator
@@ -19,6 +20,7 @@ from osm_accessibility.models import Coordinate, Node, Route
 from osm_accessibility.outputs import (
     OBSTACLE_KINDS,
     PresentationOptions,
+    build_route_comparison,
     build_route_presentation,
     edge_diagnostics,
     gpx_text,
@@ -712,3 +714,271 @@ def test_incomplete_diagnostics_or_foreign_route_is_not_silently_summarized():
     foreign = replace(route, edges=(replace(route.edges[0], tags={"highway": "steps"}),))
     with pytest.raises(DataError, match="supplied graph"):
         build_route_presentation(graph, foreign, diagnostics, profile, evaluator.parameters)
+
+
+def _standard_route(graph, start, end, parameters):
+    return find_route(graph, start, end, Evaluator(
+        Profile(name="No preferences", weights={}, wheelchair_required=False, prefer_handrail=False), parameters
+    ), distance_only=True)
+
+
+def test_demo_comparison_has_exact_contract_and_stair_encounters_not_risers(graph, evaluator):
+    selected = find_route(graph, "s", "t", evaluator)
+    standard = _standard_route(graph, "s", "t", evaluator.parameters)
+    diagnostics = edge_diagnostics(graph, selected, evaluator)
+    result = build_route_comparison(graph, selected, standard, diagnostics, evaluator.profile, evaluator.parameters)
+    assert set(result) == {"status", "same_endpoints", "same_path", "definition", "selected", "standard",
+                           "obstacle_rows", "distance_difference_m", "distance_difference_percent",
+                           "score_difference_pp", "limitations"}
+    stat_keys = {"distance_m", "score_percent", "coverage_percent", "hard_block_violations", "conflict_count",
+                 "unknown_count", "encounter_count", "obstacle_counts", "obstacles", "conflicts", "unknowns"}
+    assert set(result["selected"]) == set(result["standard"]) == stat_keys
+    assert result["status"] == "available" and result["same_endpoints"] and not result["same_path"]
+    assert all(edge.way_id.startswith("smooth_") for edge in selected.edges)
+    assert [edge.way_id for edge in standard.edges] == ["stairs", "stairs"]
+    assert result["selected"]["obstacle_counts"]["stairs"] == 0
+    assert result["standard"]["obstacle_counts"]["stairs"] == 1  # Not step_count=12 or two edges.
+    assert result["standard"]["hard_block_violations"] == 2
+    assert result["standard"]["score_percent"] is result["score_difference_pp"] is None
+    assert result["standard"]["coverage_percent"] is not None
+    assert [row["kind"] for row in result["obstacle_rows"]] == list(OBSTACLE_KINDS)
+    for row in result["obstacle_rows"]:
+        assert set(row) == {"kind", "label", "selected", "standard", "difference"}
+        assert row["difference"] == row["selected"] - row["standard"]
+    for stats in (result["selected"], result["standard"]):
+        assert set(stats["obstacle_counts"]) == set(OBSTACLE_KINDS)
+        assert stats["encounter_count"] == len(stats["obstacles"]) == sum(stats["obstacle_counts"].values())
+        assert stats["conflict_count"] == len(stats["conflicts"])
+        assert stats["unknown_count"] == len(stats["unknowns"])
+    assert result["distance_difference_m"] == pytest.approx(selected.distance_m - standard.distance_m)
+    assert result["distance_difference_percent"] == pytest.approx(
+        100 * (selected.distance_m - standard.distance_m) / standard.distance_m)
+    caveats = " ".join(result["limitations"])
+    assert "multiple type rows" in caveats and "not globally invariant" in caveats
+    assert "wheelchair hard requirement" in caveats and "matched hard constraints" in caveats
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_comparison_wheelchair_only_soft_conflict_and_separate_hard_requirement(required):
+    graph = _network([("stairs", ["s", "t"], {"highway": "steps", "wheelchair": "no"}),
+                      ("smooth", ["s", "b", "t"], {"highway": "footway", "wheelchair": "yes"})])
+    profile = Profile(weights={"wheelchair_accessible": 1}, wheelchair_required=required)
+    selected, diagnostics, evaluator = _trace(graph, ["smooth:0:f", "smooth:1:f"], profile)
+    standard = _standard_route(graph, "s", "t", evaluator.parameters)
+    result = build_route_comparison(graph, selected, standard, diagnostics, profile, evaluator.parameters)
+    baseline = result["standard"]
+    assert [row["preference"] for row in baseline["conflicts"]] == ["wheelchair_accessible"]
+    assert baseline["obstacle_counts"]["stairs"] == baseline["obstacle_counts"]["wheelchair_restriction"] == 1
+    assert baseline["hard_block_violations"] == int(required)
+    assert baseline["score_percent"] == (None if required else 0)
+    assert baseline["coverage_percent"] == 100
+    assert result["score_difference_pp"] == (None if required else 100)
+
+
+@pytest.mark.parametrize("unknown_risk", [0, .65])
+def test_feasible_comparison_uses_same_selected_weights_exposure_and_missingness(unknown_risk):
+    graph = _network([("a", ["s", "a", "t"], {"highway": "footway", "lit": "no", "surface": "asphalt"}),
+                      ("b", ["s", "b", "t"], {"highway": "footway", "lit": "yes"})],
+                     node_tags={"b": {"kerb": "raised"}})
+    profile = Profile(weights={"lit_roads": .25, "surface_type": 1, "short_kerbs": .75})
+    parameters = CostParameters(unknown_risk=unknown_risk, event_equivalent_m=37)
+    selected, diagnostics, evaluator = _trace(graph, ["a:0:f", "a:1:f"], profile, parameters)
+    standard, _, no_preferences = _trace(graph, ["b:0:f", "b:1:f"], Profile(), parameters)
+    assert route_summary(standard, no_preferences)["score_percent"] is None
+    result = build_route_comparison(graph, selected, standard, diagnostics, profile, parameters)
+    for key, route in (("selected", selected), ("standard", standard)):
+        expected = route_summary(route, evaluator)
+        assert result[key]["score_percent"] == pytest.approx(expected["score_percent"])
+        assert result[key]["coverage_percent"] == pytest.approx(expected["coverage_percent"])
+        view = build_route_presentation(graph, route, diagnostics, profile, parameters)
+        assert result[key]["obstacles"] == view["encountered_obstacles"]
+        assert result[key]["conflicts"] == view["conflicts"]
+        assert result[key]["unknowns"] == view["unknowns"]
+    assert result["standard"]["unknown_count"] == 1
+    assert result["standard"]["conflict_count"] == 1
+    assert result["score_difference_pp"] == pytest.approx(
+        result["selected"]["score_percent"] - result["standard"]["score_percent"])
+
+
+def test_comparison_same_path_zero_weights_is_not_perfect_accessibility():
+    graph = _network([("w", ["a", "b"], {"highway": "steps"})])
+    profile = Profile(weights={})
+    route, diagnostics, evaluator = _trace(graph, ["w:0:f"], profile)
+    result = build_route_comparison(graph, route, route, diagnostics, profile, evaluator.parameters)
+    assert result["same_path"] and result["selected"] == result["standard"]
+    assert result["selected"]["score_percent"] is result["selected"]["coverage_percent"] is None
+    assert result["score_difference_pp"] is None
+    assert result["distance_difference_m"] == result["distance_difference_percent"] == 0
+    view = build_route_presentation(graph, route, diagnostics, profile, evaluator.parameters)
+    view["comparison"] = result
+    report = render_route_summary(view)
+    assert "**Same path:**" in report and "**No selected soft preferences:**" in report
+    assert "unavailable, not 100% accessibility" in report
+
+
+def test_comparison_identical_feasible_path_and_zero_distance_denominator():
+    graph = _network([("w", ["a", "b"], {"highway": "footway", "lit": "no"})])
+    profile = Profile(weights={"lit_roads": 1})
+    route, diagnostics, evaluator = _trace(graph, ["w:0:f"], profile)
+    result = build_route_comparison(graph, route, route, diagnostics, profile, evaluator.parameters)
+    assert result["same_path"] and result["score_difference_pp"] == 0
+    assert all(row["difference"] == 0 for row in result["obstacle_rows"])
+    empty = Route(("a",), (), 0, 0)
+    zero = build_route_comparison(graph, empty, empty, diagnostics, profile, evaluator.parameters)
+    assert zero["distance_difference_m"] == 0
+    assert zero["distance_difference_percent"] is zero["score_difference_pp"] is None
+    view = build_route_presentation(graph, empty, diagnostics, profile, evaluator.parameters)
+    view["comparison"] = zero
+    assert "percentage not defined: zero standard distance" in render_route_summary(view)
+    json.dumps(zero, allow_nan=False)
+
+
+def test_comparison_same_path_requires_exact_directed_sequence_and_endpoints():
+    graph = _network([("w", ["a", "b", "c"], {"highway": "steps"})])
+    profile = Profile()
+    route, diagnostics, evaluator = _trace(graph, ["w:0:f", "w:1:f"], profile)
+    extra_visit, _, _ = _trace(graph, ["w:0:f", "w:0:r", "w:0:f", "w:1:f"], profile)
+    result = build_route_comparison(graph, route, extra_visit, diagnostics, profile, evaluator.parameters)
+    assert not result["same_path"]
+    for sequence in (["w:1:r", "w:0:r"], ["w:0:f"]):
+        other, _, _ = _trace(graph, sequence, profile)
+        with pytest.raises(DataError, match="same snapped endpoints"):
+            build_route_comparison(graph, route, other, diagnostics, profile, evaluator.parameters)
+
+
+def test_comparison_displays_worsening_lighting_as_well_as_reduced_stairs():
+    graph = _network([("stairs", ["s", "t"], {"highway": "steps", "lit": "yes"}),
+                      ("smooth", ["s", "b", "t"], {"highway": "footway", "lit": "no"})])
+    profile = Profile(weights={"avoid_stairs": 1, "lit_roads": .25})
+    route, diagnostics, evaluator = _trace(graph, ["smooth:0:f", "smooth:1:f"], profile)
+    standard = _standard_route(graph, "s", "t", evaluator.parameters)
+    view = build_route_presentation(graph, route, diagnostics, profile, evaluator.parameters,
+                                    baselines={"distance_only_same_constraints": {"distance_m": standard.distance_m}})
+    view["comparison"] = build_route_comparison(graph, route, standard, diagnostics, profile, evaluator.parameters)
+    rows = {row["kind"]: row for row in view["comparison"]["obstacle_rows"]}
+    assert rows["stairs"]["difference"] == -1 and rows["lighting"]["difference"] == 1
+    report = render_route_summary(view)
+    assert report.index("## Selected vs") < report.index("## Selected preferences")
+    assert "| Stairs encounters | 0 | 1 | -1 |" in report
+    assert "| Lighting encounters | 1 | 0 | +1 |" in report
+    assert "| Ramp encounters |" not in report
+    assert "## Standard route — full selected-profile assessment" in report
+    assert "Distance-only baseline under the same hard constraints:" in report
+    assert "route distance overhead:" in report
+    assert "Zero tagged stairs is not proof of no stairs" in report
+
+
+@pytest.mark.parametrize("kinds", [None, (), ("stairs",), OBSTACLE_KINDS])
+def test_comparison_is_independent_of_markers_and_does_not_copy_nested_comparison(graph, evaluator, kinds, monkeypatch):
+    route = find_route(graph, "s", "t", evaluator)
+    standard = _standard_route(graph, "s", "t", evaluator.parameters)
+    diagnostics = edge_diagnostics(graph, route, evaluator)
+    reference = build_route_comparison(graph, route, standard, diagnostics, evaluator.profile, evaluator.parameters)
+    supplied = build_route_presentation(graph, route, diagnostics, evaluator.profile, evaluator.parameters,
+                                        options=PresentationOptions(kinds, 0))
+    supplied["comparison"] = supplied  # A recursive old value must never be traversed/copied.
+    original = outputs.build_route_presentation
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append((args[1], kwargs["include_context"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(outputs, "build_route_presentation", capture)
+    result = build_route_comparison(graph, route, standard, diagnostics, evaluator.profile, evaluator.parameters,
+                                    selected_presentation=supplied)
+    assert calls == [(standard, False)]
+    assert result == reference
+    assert supplied["comparison"] is supplied
+    json.dumps(result, allow_nan=False)
+    result["selected"]["obstacles"].clear()
+    assert supplied["encountered_obstacles"]  # Returned records own their lists.
+
+
+def test_comparison_node_visits_group_by_type_not_unique_physical_feature():
+    graph = _network([("w", ["a", "b", "c"], {"highway": "footway"})], node_tags={
+        "b": {"highway": "crossing", "crossing": "unmarked", "kerb": "raised"}})
+    profile = Profile(weights={"short_kerbs": 1, "supervised_crossings": 1})
+    selected, diagnostics, evaluator = _trace(graph, ["w:0:f", "w:1:f", "w:1:r", "w:1:f"], profile)
+    standard, _, _ = _trace(graph, ["w:0:f", "w:1:f"], profile)
+    result = build_route_comparison(graph, selected, standard, diagnostics, profile, evaluator.parameters)
+    for key, count in (("selected", 2), ("standard", 1)):
+        assert result[key]["obstacle_counts"]["kerb"] == result[key]["obstacle_counts"]["crossing"] == count
+        assert result[key]["encounter_count"] == result[key]["conflict_count"] == count * 2
+        assert {row["node_id"] for row in result[key]["obstacles"]} == {"b"}
+
+
+@pytest.mark.parametrize("kinds", [None, (), OBSTACLE_KINDS])
+def test_without_context_preserves_every_onroute_record_and_skips_offroute_analysis(kinds, monkeypatch):
+    graph = _network([("on", ["a", "b", "c"], {"highway": "steps", "lit": "no"}),
+                      ("off", ["c", "d", "e"], {"highway": "steps", "name": "OFF_ROUTE_ONLY"})],
+                     node_tags={"a": {"barrier": "stile"}, "b": {"kerb": "raised"},
+                                "d": {"barrier": "stile", "name": "OFF_ROUTE_ONLY"}})
+    profile = Profile(weights={"lit_roads": 1, "surface_type": 1, "short_kerbs": 1}, wheelchair_required=True)
+    route, diagnostics, evaluator = _trace(graph, ["on:0:f", "on:1:f"], profile)
+    options = PresentationOptions(kinds, 0)
+    full = build_route_presentation(graph, route, diagnostics, profile, evaluator.parameters, options=options)
+    original = outputs._feature_details
+    calls = []
+
+    def guard(tags, record, profile, parameters, scope, edge=None):
+        assert tags.get("name") != "OFF_ROUTE_ONLY"
+        if edge is not None:
+            assert edge.id in {item.id for item in route.edges}
+        calls.append(scope)
+        return original(tags, record, profile, parameters, scope, edge)
+
+    monkeypatch.setattr(outputs, "_feature_details", guard)
+    local = build_route_presentation(graph, route, diagnostics, profile, evaluator.parameters,
+                                     options=options, include_context=False)
+    assert calls == ["way", "way", "event", "event", "event"]
+    for key in full.keys() - {"map_obstacles", "filter_summary"}:
+        assert local[key] == full[key]
+    assert local["map_obstacles"] == [row for row in full["map_obstacles"] if row["on_route"]]
+    assert local["filter_summary"]["total_candidates"] < full["filter_summary"]["total_candidates"]
+    assert local["validation"]["hard_constraint_violations"] == 2
+    assert local["conflicts"] and local["unknowns"] and local["encountered_obstacles"]
+
+
+def test_comparison_never_searches_or_reevaluates_and_masks_blocked_selected_score(monkeypatch):
+    graph = _network([("w", ["a", "b", "c"], {"highway": "steps", "wheelchair": "no"})])
+    profile = Profile(weights={"avoid_stairs": 1}, wheelchair_required=True)
+    route, diagnostics, evaluator = _trace(graph, ["w:0:f", "w:1:f"], profile)
+    view = build_route_presentation(graph, route, diagnostics, profile, evaluator.parameters)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Comparison must not search or evaluate")
+
+    monkeypatch.setattr("osm_accessibility.routing.find_route", forbidden)
+    monkeypatch.setattr(outputs, "Evaluator", forbidden)
+    view["comparison"] = build_route_comparison(graph, route, route, diagnostics, profile, evaluator.parameters,
+                                               selected_presentation=view)
+    assert view["comparison"]["selected"]["score_percent"] is None
+    report = render_route_summary(view)
+    assert "infeasible under selected requirements" in report
+    assert "**Optimized cost:** not available" in report
+    assert "**The standard path is not recommended:**" in report
+    assert "| Blocked directed traversals | 2 | 2 | +0 |" in report
+
+
+def test_standard_route_full_tables_escape_osm_text_and_keep_unknowns_separate():
+    hostile = '<script>alert(1)</script> | [link](javascript:evil)\n## injected'
+    graph = _network([("good", ["s", "b", "t"], {"highway": "footway", "lit": "yes", "surface": "asphalt"}),
+                      ("bad", ["s", "t"], {"highway": "footway", "lit": "no", "name": hostile, "surface": hostile})])
+    profile = Profile(weights={"lit_roads": 1, "surface_type": 1})
+    route, diagnostics, evaluator = _trace(graph, ["good:0:f", "good:1:f"], profile)
+    standard = _standard_route(graph, "s", "t", evaluator.parameters)
+    view = build_route_presentation(graph, route, diagnostics, profile, evaluator.parameters)
+    view["comparison"] = build_route_comparison(graph, route, standard, diagnostics, profile, evaluator.parameters)
+    report = render_route_summary(view)
+    lower = report.split("## Standard route — full selected-profile assessment", 1)[1]
+    assert "### Encountered obstacles (1 grouped encounters)" in lower
+    assert "### Known selected soft conflicts (1 grouped entries)" in lower
+    assert "### Missing data (1 grouped entries)" in lower
+    assert "&lt;script&gt;" in lower and "<script>" not in report
+    assert "[link](javascript:" not in report and "\n## injected" not in report
+    assert "\\|" in lower
+    obstacle_table = lower.split("### Known selected soft conflicts", 1)[0]
+    assert all(len(re.findall(r"(?<!\\)\|", line)) == 7
+               for line in obstacle_table.splitlines() if line.startswith("|"))

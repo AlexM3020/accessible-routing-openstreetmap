@@ -2,11 +2,11 @@
 
 A Python research toolkit for reproducible, preference-dependent pedestrian pathfinding using OpenStreetMap (OSM) data. It provides a directed graph model, configurable accessibility costs, A* and Dijkstra search, safe MongoDB snapshot ingestion, GPX export, and static diagnostic figures.
 
-**Research status:** the model implements explicit hypotheses about accessibility-related tags. Its scores are heuristic preference matches, **not measured accessibility, probabilities, or safety guarantees**. Synthetic examples demonstrate computations only. A manuscript should report real-data and independent ground-truth evaluation before claiming improved accessibility.
+**Research status:** the model implements explicit hypotheses about accessibility-related tags. Its scores are heuristic preference matches, **not measured accessibility, probabilities, or safety guarantees**. Synthetic examples demonstrate computations only; neither route is field-verified.
 
 All executable code and examples are Python. Besides this README, only minimal Python dependency/packaging metadata and ignore rules are included. Generated data, figures, credentials and run outputs are not committed.
 
-**Version 0.2 changes only result presentation and packaging.** The routing, graph construction, cost model, profiles, data ingestion and MongoDB code are unchanged. The default result is five files rather than sixteen, with the complete reproducibility evidence retained in a single archive.
+**Version 0.3.0 adds a no-preference standard-route comparison and corridor-focused maps.** Experiment orchestration computes an additional baseline; the underlying routing algorithms, graph construction, cost model, profiles and ingestion remain unchanged. The default result is still exactly five files, with complete reproducibility evidence in one archive. Corridor geometry and spatial indexing require **Shapely >=2.0,<3**, installed with the project dependencies.
 
 ## Quick start — no database required
 
@@ -23,7 +23,7 @@ On Linux/macOS, create the environment with `python3 -m venv .venv` and activate
 
 The demo constructs a **clearly artificial** network with stairs, a ramp, a barrier, controlled/uncontrolled crossings, raised/lowered kerbs, rough/smooth surfaces, slopes, missing tags and a disconnected component. The coordinate labels are illustrative; these are not surveyed paths in Erlangen.
 
-Every output directory must be new. Re-running against the same directory fails rather than silently replacing an experiment. PNG is the default; use `--format pdf` for two vector figures, or `--format both` when both image formats are useful. `--no-plots` produces just the GPX, summary and archive. `--no-baselines` skips baseline searches and the report explicitly marks their checks as not compared.
+Every output directory must be new. Re-running against the same directory fails rather than silently replacing an experiment. PNG is the default; use `--format pdf` for two vector figures, or `--format both` when both image formats are useful. `--no-plots` produces just the GPX, summary and archive. `--no-baselines` skips only the matched-hard-constraint distance and A*/Dijkstra checks, marking them as not compared; **the standard route is always computed**, including with `--no-plots`.
 
 ## Outputs and graphical checks
 
@@ -32,10 +32,18 @@ Every output directory must be new. Re-running against the same directory fails 
 | Artifact | Contents |
 | --- | --- |
 | `route.gpx` | GPX 1.1 containing every selected graph node, in route order |
-| `route_summary.md` | Readable selected preferences/requirements, encountered obstacles, known preference conflicts, missing information and numerical checks |
-| `route_obstacles.png` | Clear route-focus map with important/selected obstacles, a whole-area inset, profile summary and model checks |
-| `area_accessibility.png` | All directed segments colored by the chosen profile's score, with an unmistakable selected-route overlay and route-only score detail |
-| `reproducibility.zip` | Complete normalized inputs, manifest, diagnostics, raw tables, route geometry and presentation settings for offline verification/replotting |
+| `route_summary.md` | Selected preferences/requirements, both routes' complete obstacle/conflict/missing-data assessment, signed differences and numerical checks |
+| `route_obstacles.png` | Selected and standard routes with relevant markers, comparison metrics and clipped corridor context |
+| `area_accessibility.png` | Selected and standard route panels with the same corridor extent and selected-profile edge-score scale |
+| `reproducibility.zip` | Complete normalized inputs, manifest, diagnostics, raw tables, both route traces and presentation settings for offline verification/replotting |
+
+### Selected versus standard route
+
+The standard route minimizes mapped distance between the **same snapped endpoints** as the selected route. It uses `Profile(name="No preferences", weights={}, wheelchair_required=False, prefer_handrail=False)`, `distance_only=True` and the selected search algorithm (`--algorithm astar`, the default, or `dijkstra`). Basic pedestrian-access, physical-barrier and direction hard rules still apply; the selected wheelchair hard requirement does not.
+
+Both traces are then assessed under the **same selected profile and cost parameters**, including weights, event exposure and missing-data policy. If the standard route violates selected hard requirements, it has **no comparable profile-match score or optimized cost**, carries an infeasibility warning and is **not a recommended alternative**. No selected soft criteria means an undefined match, not 100% accessibility. Search costs with different objectives are not compared.
+
+Reported changes are **selected minus standard**: distance in metres and percent, match in percentage points (pp), and grouped obstacle/conflict/missing-data count differences. Worsening and trade-offs remain visible. Differences can reflect **relaxing the wheelchair hard requirement as well as soft preferences**, not solely a preference-cost improvement. The separate matched-hard-constraint distance baseline and A*/Dijkstra checks remain available.
 
 The terminal prints a short result with selected preferences and explicit **PREFERENCE CONFLICT** labels, not large raw node lists or hashes. Use `--json` only when you want the full machine-readable record.
 
@@ -45,20 +53,20 @@ Detailed CSV/JSON remains available **inside the archive**, not scattered over t
 
 ### Choose the obstacles to show
 
-By default, markers include stairs, important blocking barriers/restrictions, and known concerns associated with selected preferences. Neutral mapped ramps, lowered kerbs and controlled crossings do not all become markers automatically. A wheelchair restriction on the exact same stairway/barrier encounter shares its physical marker in automatic mode, retaining all selected-preference warnings. Restrictions affecting a different portion of the way keep separate markers.
+By default, markers focus on **both routes**, not every off-route POI: stairs, important blocking barriers/restrictions, and known concerns associated with selected preferences. Neutral mapped ramps, lowered kerbs and controlled crossings do not all become markers automatically. A wheelchair restriction on the exact same stairway/barrier encounter shares its physical marker in automatic mode, retaining all selected-preference warnings. Restrictions affecting a different portion of the way keep separate markers. All original raw POIs remain archived.
 
 Choose exact types when checking a specific issue:
 
 ```powershell
 python -m osm_accessibility demo --output results/stairs-check --factor 6 --obstacles stairs barrier kerb --max-markers 8
-python -m osm_accessibility plot results/stairs-check --output results/paper-figures --obstacles stairs barrier --max-markers 6 --format pdf
+python -m osm_accessibility plot results/stairs-check --output results/comparison-figures --obstacles stairs barrier --max-markers 6 --corridor-radius 100 --format pdf
 ```
 
 Available types: `stairs`, `barrier`, `wheelchair_restriction`, `kerb`, `crossing`, `incline`, `ramp`, `surface`, `smoothness`, `width`, `lighting`, `bicycles`. `--obstacles auto` restores automatic selection; `all` includes all recorded candidate types; `none` hides marker types. The special values must be used alone.
 
-The marker budget defaults to **12**, prioritizing on-route conflicts and important obstacles. Repeated geometry on the same way is grouped rather than putting a staircase marker on every edge and reverse direction. Candidates outside the route-focus viewport are not drawn on that map; nearby same-type/same-owner markers can be coalesced. Captions disclose type-filter, cropping, coalescing and marker-limit counts. **Filtering changes markers only:** the complete encountered-obstacle/conflict/missing-data report, graph, scores and GPX remain unchanged. The area score map always includes all graph edges, even when their markers are omitted.
+The shared marker budget defaults to **12** (valid range 0–100), prioritizing conflicts and important obstacles on either route. Repeated geometry on the same way is grouped rather than putting a staircase marker on every edge and reverse direction. Candidates outside the corridor are not drawn; nearby same-type/same-owner markers can be coalesced. Captions disclose type-filter, cropping, coalescing and marker-limit counts. **Filtering and marker caps change display only:** complete encounter/conflict/missing-data records and counts for both routes, graph diagnostics, scores and selected-route GPX remain unchanged.
 
-The area map scores the **mapped directed segments**, not every possible complete origin/destination route. Its highlighted path is the selected complete route. Changing `--max-markers` during replotting retains the previously selected obstacle types unless `--obstacles` is also supplied.
+The area map scores **mapped directed segments within the displayed corridor**, not every possible complete origin/destination route. Its panels highlight the selected and standard paths. Changing `--max-markers` during replotting retains the previously selected obstacle types unless `--obstacles` is also supplied.
 
 ### Read the preference/obstacle report
 
@@ -71,30 +79,35 @@ The summary distinguishes four different facts:
 
 Repeated contiguous way observations are grouped into one encounter with route segment ranges and length. Node events are associated with arrival at that node. Nonconsecutive returns remain separate encounters. The selected weight/importance and observed OSM measurement are shown, so a conflict with an Essential preference is explicit. All selected preferences and hard/soft requirement settings are listed, including wheelchair requirement, ramp use, handrail preference and minimum width.
 
+Comparison counts are **grouped encounters by type**, not stair risers, unique physical objects or counts invariant to OSM way segmentation. A physical feature can appear in multiple type rows; nonconsecutive revisits count again. Both routes' full on-route obstacles, selected soft conflicts and missing information are retained regardless of marker limits. Unknown data are not observed obstacles, and fewer encounters of one type can coexist with more of another.
+
 ### How to read the figures
 
 - Figures use a local WGS84 azimuthal-equidistant projection with metre axes and equal aspect. The coordinate conversion always passes longitude, latitude to pyproj. Graph distances used in optimization are spherical Haversine distances; plotted projection distances are for local inspection, not a replacement for those costs.
+- `--corridor-radius METRES` defaults to **150**, must be finite and satisfy **0 < radius <= 5000**, and controls both maps. Background edges are geometrically **clipped to the union of buffers around both route polylines in metric AEQD coordinates**, not merely selected by a bounding box. This is display-only: routing, normalized inputs and full archived diagnostics are not cropped. Both score panels use the same extent and color scale.
+- Long horizontal corridors use two stacked full-width score panels; other shapes use side-by-side panels. Bounds follow the corridor with small independent padding rather than expanding its narrow dimension into an empty square. Equal metric aspect is preserved, without stretching or rotating either route.
 - OSM figures carry attribution; synthetic figures explicitly state that they are artificial. No map tiles, geocoder, online basemap or map API key is needed.
 - Selected route geometry is not simplified or shifted. Every stored point appears in GPX. **Snapping gaps are not routes**, are not added to GPX, and are recorded separately in the manifest.
 - Hard-blocked directions are dashed red on the area score map, **not assigned an accessibility score of zero**. No scored exposure/active criteria is gray. Unknown attributes normally have a modeled risk and therefore a numeric score; they are not the same as no scored exposure. Scored segments use the same fixed **0–100 `cividis` scale**, with a colorbar; the range is not rescaled to make a route look better.
-- Opposite and parallel directions may have different event costs. Only the all-edge score panel offsets coincident segments by at most 1 metre to expose both directions. The caption identifies this diagnostic displacement; it does not change the graph, route or GPX.
-- The route-focus map uses a strong blue route with a white halo above pale context edges and hollow obstacle symbols. The area map outlines the selected route in contrasting navy/magenta; its companion detail retains the exact segment-score colors. The chosen path cannot disappear behind blocked reciprocal edges or marker fills. Arrow and symbol meaning is included in the legend; color is not the only cue.
-- All route conflicts remain in the summary even when marker types or their count are limited. Numbered markers point to a concise map key, not long raw tags over the path. Important off-route features are shown as context, **not claimed to be successfully avoided merely because they are outside the route**.
+- Opposite and parallel directions may have different event costs. Only the background score layer offsets coincident segments by at most 1 metre to expose both directions, then **re-clips them to the same corridor**. Corridor membership uses original geometry; these color-layer offsets do not change either route trace, graph or GPX.
+- The route-focus map uses a blue selected route and dashed orange standard route, with white halos above pale context edges and hollow obstacle symbols. The score map places the paths in separate panels and marks standard-route directions blocked under the selected profile in dashed red. Arrows, line styles and marker labels (`S`, `N`, `S+N`) supplement color; coincident paths are identified explicitly.
+- All route conflicts remain in the summary even when marker types or their count are limited. Numbered markers point to a concise map key, not long raw tags over the path. Off-route features are **not claimed to be successfully avoided merely because they are outside a route**.
 - A 100% score can occur on fully tagged ideal synthetic segments. It does not establish that the model, tags or real paths are accurate. An absent stair/kerb marker is not proof that the obstacle is absent.
 
-Recreate figures without reconnecting to MongoDB:
+Recreate figures offline from saved traces:
 
 ```powershell
 python -m osm_accessibility plot results/demo --output results/demo-figures
+python -m osm_accessibility plot results/demo --output results/demo-wide --corridor-radius 250
 ```
 
-Replotting writes the two maps and an updated readable summary. An archive can also be supplied directly instead of its containing folder. With no display overrides, saved presentation settings are used. Display selection never rewrites the original archive.
+Replotting writes the two maps and an updated readable summary. An archive can also be supplied directly instead of its containing folder. Saved marker settings and corridor radius are reused unless overridden; PNG remains the CLI default unless `--format` is supplied. Format-3 runs use **stored selected and standard traces**, not fresh searches. Formats 1/2 remain loadable subject to provenance checks, but have no stored standard comparison: the replot labels the standard route as not supplied, without rerouting or fabricating one. Display selection never rewrites the original archive.
 
 ### Figure export and model checks
 
 The PNGs use 240 DPI; `--format pdf` produces vector maps with embedded fonts. The selected preferences, route metrics, remaining conflicts and model checks give readers enough context to interpret the decision. The maps demonstrate the route choice and trade-offs **in the supplied graph**, not that all physical obstacles are known.
 
-The numerical panel/report states A*/Dijkstra cost agreement only when those comparisons were actually run, along with the absolute difference, hard-block violations and distance overhead against the matched-constraint distance baseline. These are useful case-specific checks of computational behavior; they are not proof of overall algorithm correctness, field accessibility, or safety. Paper claims about real accuracy still require independent field labels or audits. A high model-generated score cannot independently validate the model that generated it.
+The numerical panel/report states A*/Dijkstra cost agreement only when those comparisons were actually run, along with the absolute difference, hard-block violations and distance overhead against the matched-constraint distance baseline. These are useful case-specific checks of computational behavior; they are not proof of overall algorithm correctness, field accessibility, or safety. A high model-generated score cannot independently validate the model that generated it.
 
 ## Python modules
 
@@ -142,14 +155,13 @@ Execute it using an Overpass-compatible tool and save the returned **raw JSON da
 
 The recursive step preserves referenced members and nodes. `out body` retains node tags, unlike tag-free skeleton output. If using `out meta`, this importer keeps element timestamps/versions but not contributor usernames/UIDs. Overpass error `remark` fields, invalid coordinates, conflicting duplicates and missing referenced nodes/members cause validation failure. Do not use clipped geometry or `out center` as a substitute for complete way topology. For a dated study use an archived extract or a supported Overpass date query; record its source, extraction date and spatial boundary.
 
-Route directly from a local extract before uploading it:
+Route directly from a local extract:
 
 ```powershell
 python -m osm_accessibility route --osm data/erlangen.json --start 49.585 11.005 --end 49.595 11.005 --profile wheelchair --factor 6 --output results/erlangen-file
 ```
 
-These coordinates are **examples, not verified successful routes**. The route may be unavailable under the selected requirements or data coverage. No hidden relaxation of hard constraints occurs.
-
+These coordinates are **examples, not verified successful routes**. The selected route may be unavailable under its requirements or data coverage; its hard constraints are never silently relaxed. The separately labelled standard comparison deliberately omits the wheelchair hard requirement as described above.
 
 Once loaded, routing, scoring, plots and GPX generation operate entirely on the in-memory graph. There are no database writes in `route`, `plot`, `sweep` or `demo`.
 
@@ -190,7 +202,7 @@ Use built-in profiles `wheelchair`, `walking` or `distance`, or edit [examples/r
 {"name":"custom","wheelchair_required":true,"allow_ramps":true,"prefer_handrail":true,"min_width_m":1.1,"weights":{"surface_type":1,"smoothness":0.75,"short_kerbs":1,"avoid_stairs":1,"road_width":0.5,"road_incline":0.75}}
 ```
 
-Missing weights are zero. Unknown names and non-finite/out-of-range parameters fail validation. Complete normalized profiles and parameters are archived. The `distance` built-in has no soft criteria and no wheelchair requirement: do **not** compare it as if it enforced the same constraints. The automatic **distance-only baseline uses the selected profile's hard constraints**, avoiding that confound.
+Missing weights are zero. Unknown names and non-finite/out-of-range parameters fail validation. Complete normalized profiles and parameters are archived. The `distance` built-in has no soft criteria and no wheelchair requirement: do **not** treat it as enforcing the same constraints. Likewise, the new **standard comparison** relaxes the wheelchair requirement. The separate **matched-constraint distance baseline** retains the selected profile's hard requirements and measures distance overhead without that confound.
 
 ### Cost and A* correctness
 
@@ -220,9 +232,9 @@ Each run's archive records normalized input fingerprint, graph fingerprint, full
 
 Saved-run validation checks mandatory artifact hashes and recomputes route length, score, costs and exposure from the recorded graph/profile. Hashes detect accidental changes and aid reproduction; the manifest is not digitally signed and is not proof of authenticity against someone deliberately rewriting the entire experiment archive.
 
-New archives use format 2. Version 0.1's full-directory outputs remain loadable when their recorded implementation is the recognized original release and the scientific-core fingerprint is unchanged. Plot/report edits no longer require changing the data/model implementation. Unknown older implementations or a changed scientific core still fail with an instruction to use the original revision. The original run is never rewritten during replotting. Archive files are checksummed internally; loading a whole result directory also checks the visible GPX, summary and figures. A standalone archive does not require its external figures to travel with it.
+New archives use **format 3**. The manifest stores the standard route's node/edge trace, search algorithm, no-preference profile and distance-only objective; presentation data stores the full selected-profile comparison. This adds **no extra visible file or second GPX**. Format-2 archives and recognized format-1 full-directory runs remain loadable with the existing provenance/scientific-core checks, without inventing a missing standard comparison. Unknown older implementations or a changed scientific core still fail with an instruction to use the original revision. The original run is never rewritten during replotting. Archive files are checksummed internally; loading a whole result directory also checks the visible GPX, summary and figures. A standalone archive does not require its external figures to travel with it.
 
-Baseline output compares A*, Dijkstra with the same accessibility objective, and distance-only Dijkstra with the **same hard requirements and snapped endpoints**. A*/Dijkstra optimal-cost disagreement raises an error. Tied optimal paths can differ in independent implementations; cost equality matters more than one arbitrary node sequence. Search time excludes loading, graph construction, snapping, exports and plots; fresh cost caches are used for each timed search. It is not an end-to-end latency measurement.
+In addition to the always-computed standard route, optional baseline checks compare A*, Dijkstra with the same accessibility objective, and distance-only Dijkstra with the **same selected hard requirements and snapped endpoints**. Only these checks are skipped by `--no-baselines`. A*/Dijkstra optimal-cost disagreement raises an error. Tied optimal paths can differ in independent implementations; cost equality matters more than one arbitrary node sequence. Search time excludes loading, graph construction, snapping, exports and plots; fresh cost caches are used for each timed search. It is not an end-to-end latency measurement.
 
 Run a parameter sensitivity experiment on archived inputs:
 
@@ -230,7 +242,9 @@ Run a parameter sensitivity experiment on archived inputs:
 python -m osm_accessibility sweep results/demo --output results/sensitivity --factors 0 1.5 6 --unknown-risks 0.25 0.5 0.75 --repeats 3
 ```
 
-This writes CSV/JSON observations for factor, unknown risk, algorithm, distance, cost, score, coverage, nodes expanded and search time. It retains the original snapped endpoints and profile constraints. Repeated timings on a tiny example are not evidence of large-scale performance. Plot computation deliberately evaluates the whole graph and must not be included in claims about A* query time.
+This writes CSV/JSON observations for factor, unknown risk, algorithm, distance, cost, score, coverage, nodes expanded and search time. It retains the original snapped endpoints and profile constraints. Repeated timings on a tiny example are not evidence of large-scale performance. Full-graph diagnostics are retained even though the maps show only the corridor; diagnostics, presentation and exports must not be included in claims about A* query time.
+
+Version 0.3.0 skips context-only obstacle candidate generation for paired-route presentations, uses indexed **exact nearest-segment** distances instead of the former candidate-by-route-segment (`P × R`) scan, and writes ZIP evidence with fast DEFLATE compression level **1**. These changes retain the same raw evidence and complete on-route reports. No real-data 2 km end-to-end runtime or measured speedup is claimed here; those require representative benchmarks.
 
 ### Tests
 
@@ -242,9 +256,11 @@ python -m ruff check .
 
 The suite uses artificial graphs, OSM fixtures generated in Python and a mock MongoDB database. It checks cost decomposition, subdivision invariance, constraints, missingness, exact GPX order, import safety/fingerprints, route optimality, saved-run validation and the actual plotting artifacts. It does **not** certify a live MongoDB deployment, geospatial index behavior on a real server, true wheelchair accessibility or an entire city dataset.
 
-The original 115-test scientific baseline is retained and extended with presentation-only checks: exact foreground route geometry and draw order, all area-edge score values, marker priorities/caps, nontruncated conflict summaries, unknown-versus-known observations, compact archive integrity, optional details, and old-run replot compatibility. Verification includes unchanged GPX geometry and route costs under different display settings. No empirical accessibility results or live database tests are implied by these checks.
+The original scientific baseline is extended with comparison, orchestration and presentation checks: same-endpoint standard routing, selected-profile assessment and infeasibility, complete counts despite marker caps, corridor clipping and indexed distances, exact foreground traces, archive integrity and old-run replot compatibility. Display-setting checks cover unchanged selected-route GPX geometry and route costs. No empirical accessibility results or live database tests are implied by these checks.
 
-Version 0.2 local verification on Python 3.12.10: **267 passed, 1 skipped**, approximately **92% branch-aware coverage**. The skip requires symbolic-link permissions unavailable on this Windows system. Lint, dependency consistency, source compilation and wheel building passed. PNG/PDF examples were inspected, including a ten-preference synthetic case with six known conflicts and one missing-data observation. The scientific-core fingerprint is unchanged from version 0.1.
+**Version 0.3 verification:** Python 3.12.10 recorded **343 passed, 1 skipped**, approximately **93% branch-aware coverage**; lint and dependency consistency passed. The skip requires unavailable Windows symbolic-link permissions. PNG/PDF layouts were inspected for the small example and a synthetic ~2 km route.
+
+One synthetic scalability check used **6,561 nodes and 25,920 directed edges**, identical inputs/interpreter and PNG-only output. The selected ~2.1 km trace, distance, cost and score were unchanged: version 0.2 took **12.19 s**, and the comparison implementation took **10.55 s** including the extra standard search (before final framing polish). Separately, exact distances for 4,000 candidates against 800 segments of a 2 km path took **1.447 s** by scanning versus **0.017 s** with the spatial index (~84× for that component, **not** the whole workflow). These are single local synthetic measurements, not a promise about a particular real extract, machine, or field accessibility.
 
 ## Data attribution and references
 

@@ -2,8 +2,9 @@
 
 No data are fetched and no scores are recomputed. ``score`` includes transition
 events; ``way_score`` is not substituted for it. Geometry consists of the stored
-node-to-node segments: missing intermediate shapes are not inferred. Coincident
-edges are separated only in the area score layer, never in the selected path.
+node-to-node segments: missing intermediate shapes are not inferred. Both routes
+remain unshifted; background geometry is clipped to their metric corridor union.
+Coincident background score directions use bounded offsets before re-clipping.
 Marker filtering, cropping and coalescing affect drawings, not the full report.
 """
 
@@ -13,7 +14,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
-from math import atan2, cos, degrees, fsum, hypot, isfinite, radians, sin
+from math import atan2, ceil, cos, degrees, fsum, hypot, isfinite, radians, sin
 from numbers import Real
 from pathlib import Path
 from textwrap import shorten, wrap
@@ -26,11 +27,16 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 from matplotlib.transforms import Bbox
 from pyproj import CRS, Transformer
 from pyproj.exceptions import ProjError
+from shapely import STRtree
+from shapely import points as spatial_points
+from shapely.geometry import LineString
+from shapely.geometry import Point as SpatialPoint
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 from .graph import InMemoryGraph
 from .models import Edge, Route
@@ -41,8 +47,8 @@ Segment = tuple[Point, Point]
 Extent = tuple[float, float, float, float]
 
 _BLUE = "#1464b4"
+_ORANGE = "#df7c16"
 _NAVY = "#182b49"
-_MAGENTA = "#c12681"
 _RED = "#c52b2f"
 _GREY = "#8c8c8c"
 _GRAPH_GREY = "#e7e9ec"
@@ -87,10 +93,11 @@ def _project(transformer: Transformer, longitude: float, latitude: float) -> Poi
     return float(x), float(y)
 
 
-def _project_graph(graph: InMemoryGraph) -> tuple[dict[str, Point], Transformer]:
+def _project_graph(graph: InMemoryGraph, centre_nodes: Sequence[str] | None = None
+                   ) -> tuple[dict[str, Point], Transformer]:
     if not graph.nodes:
         raise ValueError("A local projection requires at least one graph node")
-    coordinates = [graph.nodes[key].coordinate for key in sorted(graph.nodes)]
+    coordinates = [graph.nodes[key].coordinate for key in sorted(set(centre_nodes) if centre_nodes is not None else graph.nodes)]
     # A spherical mean keeps local extracts crossing the antimeridian local.
     latitudes = [radians(point.latitude) for point in coordinates]
     longitudes = [radians(point.longitude) for point in coordinates]
@@ -222,6 +229,128 @@ def _count(value: object, label: str) -> int:
     return value
 
 
+def _path_geometries(paths: Sequence[Sequence[Point]]) -> list[BaseGeometry]:
+    """Separate paths, never a fictitious connection between route endpoints."""
+    return [LineString(path) if len(path) > 1 and len(set(path)) > 1 else SpatialPoint(path[0])
+            for path in paths if path]
+
+
+def _indexed_path_distances(candidates: Sequence[Point], paths: Sequence[Sequence[Point]]) -> list[float]:
+    """Batched exact point-to-segment distances, not nearest vertex distances."""
+    if not candidates:
+        return []
+    segments: list[BaseGeometry] = []
+    for path in paths:
+        if len(path) == 1:
+            segments.append(SpatialPoint(path[0]))
+        segments.extend(LineString((a, b)) if a != b else SpatialPoint(a)
+                        for a, b in zip(path, path[1:]))
+    tree = STRtree(segments)
+    indices, distances = tree.query_nearest(spatial_points(candidates), return_distance=True, all_matches=False)
+    result = [float("inf")] * len(candidates)
+    for index, distance in zip(indices[0], distances):
+        result[int(index)] = float(distance)
+    return result
+
+
+@dataclass(frozen=True)
+class _Corridor:
+    geometry: BaseGeometry
+    segments: Mapping[str, list[Segment]]
+    extent: Extent
+    radius_m: float
+
+
+def _geometry_parts(shape: BaseGeometry) -> list[Segment]:
+    if shape.is_empty:
+        return []
+    if shape.geom_type == "LineString":
+        coordinates = list(shape.coords)
+        return [(tuple(a), tuple(b)) for a, b in zip(coordinates, coordinates[1:])]
+    if shape.geom_type == "Point":
+        point = tuple(shape.coords[0])
+        return [(point, point)]
+    return [segment for part in shape.geoms for segment in _geometry_parts(part)]
+
+
+def _corridor_scores(graph: InMemoryGraph, positions: Mapping[str, Point],
+                     corridor: _Corridor) -> dict[str, list[Segment]]:
+    """Offset only original corridor members, then clip to the original buffer.
+
+    Unchanged segments reuse their intersection. No nearest-path scans, new
+    corridor selection, or graph mutations are needed for the score layer.
+    """
+    if not corridor.segments:
+        return {}
+    shifted = score_segments(graph, positions)
+    result = {}
+    for edge in graph.edges:
+        if edge.id not in corridor.segments:
+            continue
+        segment = shifted[edge.id]
+        if segment == (positions[edge.source], positions[edge.target]):
+            result[edge.id] = corridor.segments[edge.id]
+        else:
+            shape = LineString(segment) if segment[0] != segment[1] else SpatialPoint(segment[0])
+            result[edge.id] = _geometry_parts(shape.intersection(corridor.geometry))
+    return result
+
+
+def _corridor(graph: InMemoryGraph, positions: Mapping[str, Point],
+              paths: Sequence[Sequence[Point]], radius_m: float, ratio: float = _ROUTE_RATIO) -> _Corridor:
+    """Clip intersecting graph edges in AEQD metres; retain each edge's identity.
+
+    GEOS buffers approximate round arcs (64 segments per quadrant); the spatial
+    prefilter uses exact dwithin distances, including crossings whose endpoints
+    are outside the corridor. Route paths are rendered separately, in full.
+    ``ratio`` is retained for caller compatibility, not used to expand bounds:
+    each original buffer dimension gets small independent padding. Equal metric
+    aspect is enforced by the axes box, never by adding empty map territory.
+    """
+    routes = _path_geometries(paths)
+    geometry = unary_union([path.buffer(radius_m, quad_segs=64) for path in routes])
+    xmin, ymin, xmax, ymax = geometry.bounds
+    padx, pady = max((xmax - xmin) * .04, 2.), max((ymax - ymin) * .04, 2.)
+    extent = (xmin - padx, xmax + padx, ymin - pady, ymax + pady)
+    edges = list(graph.edges)
+    raw = _true_segments(edges, positions)
+    lines = [LineString(raw[edge.id]) if raw[edge.id][0] != raw[edge.id][1]
+             else SpatialPoint(raw[edge.id][0]) for edge in edges]
+    tree = STRtree(lines)
+    indices = tree.query(routes, predicate="dwithin", distance=radius_m)
+    clipped: dict[str, list[Segment]] = {}
+
+    for index in sorted(set(indices[1])):
+        edge = edges[index]
+        result = _geometry_parts(lines[index].intersection(geometry))
+        if result:
+            clipped[edge.id] = result
+    return _Corridor(geometry, clipped, extent, radius_m)
+
+
+def _comparison_markers(presentation: dict | None, standard_route: Route | None) -> dict | None:
+    """Fresh display-only union; complete comparison encounter counts stay intact."""
+    if presentation is None or standard_route is None:
+        return presentation
+    comparison = presentation.get("comparison", {})
+    standard = comparison.get("standard", {}).get("obstacles", [])
+    options = presentation.get("options", {})
+    kinds = options.get("obstacle_kinds", presentation.get("filter_summary", {}).get("selected_kinds"))
+    standard_rows = [dict(row, route_affiliation="standard", on_route=True) for row in standard if (
+        row["kind"] in kinds if kinds is not None else
+        row["kind"] in {"stairs", "barrier", "wheelchair_restriction"}
+        or bool(row.get("preference_labels")) or row["status"] in {"blocked", "conflict"}
+    )]
+    rows = [dict(row, route_affiliation="selected" if row["on_route"] else "context")
+            for row in presentation.get("map_obstacles", [])]
+    # Keep candidate accounting intact; sharing happens after AUTO consolidation.
+    rows.extend(standard_rows)
+    summary = dict(presentation.get("filter_summary", {}))
+    omitted = summary.get("omitted_by_filter", 0) + len(standard) - len(standard_rows)
+    summary.update(selected_candidates=len(rows), total_candidates=len(rows) + omitted, omitted_by_filter=omitted)
+    return dict(presentation, map_obstacles=rows, filter_summary=summary)
+
+
 def _marker_candidates(pois: list[dict], presentation: dict | None,
                        transformer: Transformer) -> tuple[list[dict], dict[str, int]]:
     if presentation is not None and not isinstance(presentation, Mapping):
@@ -307,41 +436,96 @@ def _distance_to_path(point: Point, points: Sequence[Point]) -> float:
 
 
 def _select_obstacles(pois: list[dict], presentation: dict | None, transformer: Transformer,
-                      points: Sequence[Point]) -> tuple[list[dict], dict[str, int], Extent]:
+                      points: Sequence[Point], *, paths: Sequence[Sequence[Point]] | None = None,
+                      corridor: _Corridor | None = None) -> tuple[list[dict], dict[str, int], Extent]:
     candidates, counts = _marker_candidates(pois, presentation, transformer)
-    extent = _extent(points, _ROUTE_RATIO)
+    paths = paths if paths is not None else [points]
+    extent = corridor.extent if corridor is not None else _extent(points, _ROUTE_RATIO)
     xmin, xmax, ymin, ymax = extent
     visible = [row for row in candidates if xmin <= row["position"][0] <= xmax
                and ymin <= row["position"][1] <= ymax]
+    if corridor is not None:
+        visible = [row for row in visible if corridor.geometry.covers(SpatialPoint(row["position"]))]
     counts["cropped"] = len(candidates) - len(visible)
     counts["unknown_suppressed"] = sum(row["status"] == "unknown" for row in visible)
+    known = [row for row in visible if row["status"] != "unknown"]
+    # AUTO only: consolidate a wheelchair restriction with its physical stairs /
+    # barrier encounter. Exact owners, directed edges, visit and affiliation are
+    # required; proximity alone is never evidence of a shared observation.
+    options = (presentation or {}).get("options", {})
+    summary = (presentation or {}).get("filter_summary", {})
+    automatic = presentation is not None and options.get("obstacle_kinds", summary.get("selected_kinds")) is None
+    if automatic:
+        def physical_identity(row):
+            return (row["node_id"], row["way_id"], tuple(row["edge_ids"]), row["first_segment"],
+                    row["position"], row["on_route"], row.get("route_affiliation"))
+        physical = {physical_identity(row): row for row in known
+                    if row["kind"] in {"stairs", "barrier"}
+                    and (row["node_id"] is not None or row["way_id"] is not None)}
+        retained = []
+        for row in known:
+            primary = physical.get(physical_identity(row)) if row["kind"] == "wheelchair_restriction" else None
+            if primary is None:
+                retained.append(row)
+                continue
+            primary["preference_labels"] = list(dict.fromkeys(primary["preference_labels"] + row["preference_labels"]))
+            primary["description"] += "; " + row["description"]
+            primary["display_label"] = OBSTACLE_LABELS[primary["kind"]] + " + wheelchair restriction"
+            primary.setdefault("combined_ids", []).append(row["id"])
+            rank = {"context": 0, "encountered": 1, "conflict": 2, "blocked": 3}
+            primary["status"] = max((primary["status"], row["status"]), key=rank.__getitem__)
+        known = retained
+    def shared_identity(row):
+        return (row["kind"], row["node_id"], row["way_id"], tuple(row["edge_ids"]),
+                row["position"], row["status"], row["description"], tuple(row["preference_labels"]))
+    selected_rows = {shared_identity(row): row for row in known
+                     if row.get("route_affiliation") == "selected" and row["edge_ids"]
+                     and (row["node_id"] is not None or row["way_id"] is not None)}
+    retained = []
+    for row in known:
+        primary = selected_rows.get(shared_identity(row)) if row.get("route_affiliation") == "standard" else None
+        if primary is None:
+            retained.append(row)
+        else:
+            primary["route_affiliation"] = "both"
+            primary.setdefault("combined_ids", []).extend([row["id"], *row.get("combined_ids", [])])
+            if "display_label" in row:
+                primary["display_label"] = row["display_label"]
+    known = retained
+    # No marker budget means no nearest-distance work, including tree creation.
+    distances = (_indexed_path_distances([row["position"] for row in known], paths)
+                 if counts["max_markers"] else [0.] * len(known))
+    by_identity = {id(row): distance for row, distance in zip(known, distances)}
 
     def priority(row):
         rank = (0 if row["on_route"] and row["status"] == "conflict" else
                 1 if row["status"] == "blocked" or row["kind"] in {"stairs", "barrier", "wheelchair_restriction"} else
                 2 if row["on_route"] else 3)
         segment = row["first_segment"] if row["on_route"] and row["first_segment"] is not None else float("inf")
-        return (rank, not row["on_route"], segment, _distance_to_path(row["position"], points),
+        return (rank, not row["on_route"], segment, by_identity[id(row)],
             row["kind"], row["id"], row["position"], row["node_id"] or "", row["way_id"] or "",
             tuple(row["edge_ids"]), tuple(row["preference_labels"]), row["description"])
 
     groups: list[dict] = []
     buckets: dict[tuple, list[dict]] = defaultdict(list)
-    for row in sorted((row for row in visible if row["status"] != "unknown"), key=priority):
+    for row in sorted(known, key=priority):
         owner = ("node", row["node_id"]) if row["node_id"] is not None else (
             ("way", row["way_id"]) if row["way_id"] is not None else ("point", row["position"])
         )
-        key = (row["kind"], row["on_route"], row["status"], owner)
+        key = (row["kind"], row["on_route"], row["status"], row.get("route_affiliation"), owner,
+               tuple(row["edge_ids"]) if row.get("route_affiliation") else None)
         match = next((group for group in buckets[key] if hypot(
             group["position"][0] - row["position"][0], group["position"][1] - row["position"][1]
         ) <= _COALESCE_M), None)
         if match is None:
-            match = dict(row, member_ids=[row["id"]], candidate_count=1)
+            members = [row["id"], *row.get("combined_ids", [])]
+            match = dict(row, member_ids=members, candidate_count=len(members))
             groups.append(match)
             buckets[key].append(match)
         else:
-            match["candidate_count"] += 1
-            match["member_ids"].append(row["id"])
+            members = [row["id"], *row.get("combined_ids", [])]
+            match["candidate_count"] += len(members)
+            match["member_ids"].extend(members)
             for field in ("edge_ids", "preference_labels"):
                 match[field] = list(dict.fromkeys([*match[field], *row[field]]))
     displayed = [dict(row, marker_label=str(index + 1) if index < _MAX_LABELS else None)
@@ -354,22 +538,35 @@ def _select_obstacles(pois: list[dict], presentation: dict | None, transformer: 
 
 
 def select_map_obstacles(graph: InMemoryGraph, route: Route, pois: list[dict], *,
-                         presentation: dict | None = None) -> tuple[list[dict], dict[str, int], Extent]:
+                         presentation: dict | None = None, standard_route: Route | None = None,
+                         corridor_radius_m: float = 150.0) -> tuple[list[dict], dict[str, int], Extent]:
     """Return fresh display rows, accounting counts and (xmin, xmax, ymin, ymax).
 
-    Presentation map_obstacles are already type-filtered; never supplement them
-    from POIs, conflicts or unknowns. Legacy calls select stairs / blocked barriers.
+    Selected map_obstacles are already type-filtered; never supplement them from
+    POIs, conflicts or unknowns. When a standard trace is supplied, its comparison
+    encounters use the same display filters and shared cap. Legacy calls select
+    stairs / blocked barriers. Both route buffers define the metric viewport.
     Within the route viewport, prioritize on-route conflicts, important features,
     other encounters, then proximity. Merge only nearby same-type/same-owner rows
     with the same status and route membership, retaining a real representative
     point, member IDs and counts. Without an owner, only exact coincidences merge.
+    AUTO combines wheelchair restrictions with exact same-owner, same-directed-
+    edge stairs/barrier encounters; explicit type filters retain separate symbols.
+    Shared-route symbols require matching directed identities and observations.
     At most 12 markers are numbered, even for an explicitly larger marker limit.
     selected_candidates = cropped + displayed + suppressed; suppressed includes
     unknown observations, coalesced rows and distinct markers beyond the limit.
     """
     _validate_route(graph, route)
-    positions, transformer = _project_graph(graph)
-    return _select_obstacles(pois, presentation, transformer, [positions[key] for key in route.nodes])
+    radius = _validated_radius(corridor_radius_m)
+    if standard_route is not None:
+        _validate_route(graph, standard_route)
+    routes = [route] + ([standard_route] if standard_route is not None else [])
+    positions, transformer = _project_graph(graph, [node for path in routes for node in path.nodes])
+    paths = [[positions[key] for key in path.nodes] for path in routes]
+    corridor = _corridor(graph, positions, paths, radius)
+    return _select_obstacles(pois, _comparison_markers(presentation, standard_route), transformer,
+                             paths[0], paths=paths, corridor=corridor)
 
 
 def _map_axes(ax: Axes, points: Sequence[Point], title: str, *, extent: Extent | None = None) -> None:
@@ -397,11 +594,12 @@ def _directions(ax: Axes, segments: Sequence[Segment], colours: Sequence[str], g
     moving = [(a, b, colour) for (a, b), colour in zip(segments, colours) if a != b]
     if not moving:
         return
-    # Only the selected path gets arrows, with a deterministic sparse sample.
+    # A deterministic sparse sample for either route, never the background.
     moving = moving[::max(1, (len(moving) + 5) // 6)][:6]
+    fraction = .68 if gid == "standard-directions" else .4
     arrows = ax.quiver(
-        [a[0] + 0.4 * (b[0] - a[0]) for a, b, _ in moving],
-        [a[1] + 0.4 * (b[1] - a[1]) for a, b, _ in moving],
+        [a[0] + fraction * (b[0] - a[0]) for a, b, _ in moving],
+        [a[1] + fraction * (b[1] - a[1]) for a, b, _ in moving],
         [0.22 * (b[0] - a[0]) for a, b, _ in moving],
         [0.22 * (b[1] - a[1]) for a, b, _ in moving],
         color=[colour for _, _, colour in moving], angles="xy", scale_units="xy", scale=1,
@@ -453,6 +651,21 @@ def _route_line(ax: Axes, route: Route, positions: Mapping[str, Point], *,
     line.set_gid("selected-route")
 
 
+def _standard_line(ax: Axes, route: Route, positions: Mapping[str, Point]) -> None:
+    points = [positions[key] for key in route.nodes]
+    # A dashed white halo leaves the selected solid blue visible through gaps,
+    # including on shared sections. Neither path is shifted off its geometry.
+    for colour, width, zorder, gid in (("white", 5.8, 14, "standard-halo"),
+                                       (_ORANGE, 3.2, 15, "standard-route")):
+        line, = ax.plot(*zip(*points), color=colour, linewidth=width, linestyle=(0, (5, 4)),
+                        zorder=zorder, dash_capstyle="butt")
+        # Use an identical physical dash period for both widths (mpl scales dashes).
+        line.set_dashes((16 / width, 12 / width))
+        line.set_gid(gid)
+    segments = [(positions[edge.source], positions[edge.target]) for edge in route.edges]
+    _directions(ax, segments, [_ORANGE] * len(segments), "standard-directions")
+
+
 def _finish_route(ax: Axes, route: Route, positions: Mapping[str, Point], colour: str) -> None:
     _endpoints(ax, route, positions)
     segments = [(positions[edge.source], positions[edge.target]) for edge in route.edges]
@@ -461,12 +674,17 @@ def _finish_route(ax: Axes, route: Route, positions: Mapping[str, Point], colour
 
 def _score_lines(ax: Axes, edges: Sequence[Edge], segments: Mapping[str, Segment],
                  scores: Mapping[str, _Score], scale: ScalarMappable, prefix: str, *,
-                 width: float = 2.2, zorder: int = 2) -> None:
+                 width: float = 2.2, zorder: int = 2,
+                 clipped: Mapping[str, list[Segment]] | None = None) -> None:
+    def geometry_for(edge):
+        return clipped.get(edge.id, []) if clipped is not None else [segments[edge.id]]
+
     active = [edge for edge in edges if not scores[edge.id].blocked and scores[edge.id].value is not None]
-    unscored = [segments[edge.id] for edge in edges if not scores[edge.id].blocked and scores[edge.id].value is None]
-    if active:
-        geometry = [segments[edge.id] for edge in active]
-        values = [scores[edge.id].value for edge in active]
+    unscored = [part for edge in edges if not scores[edge.id].blocked and scores[edge.id].value is None
+                for part in geometry_for(edge)]
+    geometry = [part for edge in active for part in geometry_for(edge)]
+    if geometry:
+        values = [scores[edge.id].value for edge in active for _ in geometry_for(edge)]
         collection = LineCollection(geometry, cmap=scale.cmap, norm=scale.norm, linewidths=width, zorder=zorder)
         collection.set_array(values)
         collection.set_gid(f"{prefix}-score")
@@ -476,7 +694,7 @@ def _score_lines(ax: Axes, edges: Sequence[Edge], segments: Mapping[str, Segment
                 ax.scatter(*start, color=scale.to_rgba(value), s=22, zorder=zorder)
     if unscored:
         _lines(ax, unscored, _GREY, f"{prefix}-unscored", width=width, zorder=zorder)
-    blocked = [segments[edge.id] for edge in edges if scores[edge.id].blocked]
+    blocked = [part for edge in edges if scores[edge.id].blocked for part in geometry_for(edge)]
     if blocked:
         _lines(ax, blocked, _RED, f"{prefix}-blocked", dashed=True, width=width, zorder=zorder + 1)
     if not edges:
@@ -523,11 +741,22 @@ def _obstacles(ax: Axes, rows: Sequence[dict], endpoints: Sequence[Point]) -> No
 
 def _marker_key(ax: Axes, rows: Sequence[dict]) -> None:
     ax.set_axis_off()
-    ax.text(0, .99, "Numbered map key", fontsize=10, weight="bold", va="top")
+    comparison = ax.get_position().width > .2
+    height = ax.get_position().height * ax.figure.get_size_inches()[1]
+    heading = ax.text(0, .99, "Numbered map key", fontsize=10, weight="bold", va="top")
+    heading.set_gid("key-heading")
+    if comparison:
+        affiliation = ax.text(0, 1 - .20 / height, "S selected · N standard · S+N shared", fontsize=9, va="top")
+        affiliation.set_gid("key-affiliation")
     for index, row in enumerate(rows[:_MAX_LABELS]):
         count = f" ×{row['candidate_count']}" if row["candidate_count"] > 1 else ""
-        text = f"{row['marker_label']}  {OBSTACLE_LABELS[row['kind']]}{count}"
-        label = ax.text(0, .88 - index * .071, text, va="top", fontsize=9, color=_marker_colour(row))
+        affiliation = {"selected": "S", "standard": "N", "both": "S+N", "context": "context"}.get(row.get("route_affiliation"))
+        suffix = f" [{affiliation}]" if affiliation else ""
+        text = f"{row['marker_label']}  {row.get('display_label', OBSTACLE_LABELS[row['kind']])}{count}{suffix}"
+        x, y = ((index % 2) * .51, 1 - (.40 + (index // 2) * .26) / height) if comparison else (0, .88 - index * .071)
+        if comparison:
+            text = "\n".join(wrap(text, width=32))
+        label = ax.text(x, y, text, va="top", fontsize=9, color=_marker_colour(row), linespacing=1.05)
         label.set_gid("obstacle-key")
     if not rows:
         ax.text(0, .86, "No markers in view.", fontsize=9)
@@ -556,8 +785,9 @@ def _summary_panel(ax: Axes, route: Route, presentation: dict | None) -> None:
     put("Profile: " + _short(view.get("profile_name", "not supplied"), 52), bold=True, size=12)
     put(f"Distance {_metric(metrics.get('distance_m', route.distance_m), ' m')}   ·   "
         f"Cost {_metric(metrics.get('cost_m', route.cost), ' m')}")
-    put(f"Preference match {_metric(metrics.get('score_percent'), '%')}   ·   "
-        f"Coverage {_metric(metrics.get('coverage_percent'), '%')}")
+    score = "No active score" if "score_percent" in metrics and metrics["score_percent"] is None else _metric(metrics.get("score_percent"), "%")
+    coverage = "No active score" if "coverage_percent" in metrics and metrics["coverage_percent"] is None else _metric(metrics.get("coverage_percent"), "%")
+    put(f"Preference match {score}   ·   Coverage {coverage}")
     y -= .01
     put("Selected preferences · weights", bold=True)
     preferences = view.get("selected_preferences", [])
@@ -628,45 +858,175 @@ def _figure(title: str, heading: str, synthetic: bool, size: tuple[float, float]
     FigureCanvasAgg(figure)
     figure.text(.065, .97, heading + " — " + _short(title, 70), fontsize=15, weight="bold", parse_math=False)
     if synthetic:
-        badge = figure.text(.975, .97, "SYNTHETIC DATA", ha="right", fontsize=10, weight="bold", color="#6b440b",
+        badge = figure.text(.975, .935, "SYNTHETIC DATA", ha="right", fontsize=10, weight="bold", color="#6b440b",
                             bbox={"boxstyle": "round,pad=.35", "facecolor": "#fff1cf", "edgecolor": "none"})
         badge.set_gid("synthetic-badge")
     return figure
 
 
+def _comparison_panel(ax: Axes, presentation: dict | None, route: Route, standard: Route) -> None:
+    ax.set_axis_off()
+    view = presentation or {}
+    comparison = view.get("comparison", {})
+    height = ax.get_position().height * ax.figure.get_size_inches()[1]
+    y = 0.
+
+    def put(text, *, size=9, bold=False, colour=_NAVY, gid="comparison-profile", advance=.18):
+        nonlocal y
+        artist = ax.text(0, 1 - y / height, text, fontsize=size, weight="bold" if bold else "normal",
+                         color=colour, va="top", linespacing=1.1, parse_math=False)
+        artist.set_gid(gid)
+        y += advance
+
+    put("Selected vs no-preference standard", size=11, bold=True, advance=.26)
+    put("Profile: " + _short(view.get("profile_name", "not supplied"), 55), advance=.22)
+    put("Selected preferences · weights", bold=True)
+    preferences = view.get("selected_preferences", [])
+    for index, item in enumerate(preferences):
+        text = f"{item.get('label', item.get('name', 'Preference'))}  {item['weight']:g}"
+        artist = ax.text((index % 2) * .51, 1 - (y + index // 2 * .18) / height,
+                         text, fontsize=9, va="top", parse_math=False)
+        artist.set_gid("comparison-preference")
+    y += max(1, (len(preferences) + 1) // 2) * .18
+    if not preferences:
+        artist = ax.text(0, 1 - (y - .18) / height, "None selected" if presentation is not None else "Not supplied",
+                         fontsize=9, va="top")
+        artist.set_gid("comparison-preference")
+    settings = [item.split(". ", 1)[0] for item in view.get("requirements", [])
+                if item.startswith(("Wheelchair required:", "Ramps allowed:", "Handrail preferred:", "Minimum width:"))]
+    # Two short lines retain the explicit hard/soft distinction without policy prose.
+    for offset in (0, 2):
+        if settings[offset:offset + 2]:
+            put(" · ".join(settings[offset:offset + 2]))
+    y = _comparison_profile_height(view)
+    if comparison.get("status") != "available":
+        put("Comparison assessment not supplied.\nDistances (m): "
+                f"{route.distance_m:.1f} / {standard.distance_m:.1f}\n"
+                "No obstacle counts or feasibility inferred.")
+        return
+    selected, baseline = comparison["selected"], comparison["standard"]
+    records = []
+    worse = []
+    def add(label, key, suffix="", precision=0):
+        values = [stats.get(key) for stats in (selected, baseline)]
+        delta = values[0] - values[1] if all(value is not None for value in values) else None
+        rendered = [("No active score" if key in {"score_percent", "coverage_percent"} and key in stats
+                     else "Not supplied") if value is None else _metric(value, suffix, precision=precision)
+                    for stats, value in zip((selected, baseline), values)]
+        records.append([label, *rendered, "—" if delta is None else f"{delta:+.{precision}f}" + (" pp" if suffix == "%" else "")])
+        worse.append(delta is not None and (delta < 0 if suffix == "%" else delta > 0))
+    add("Distance (m)", "distance_m", precision=1)
+    records.append(["Selected requirements", *["Infeasible" if stats["hard_block_violations"] else "Feasible"
+                                               for stats in (selected, baseline)], "—"])
+    worse.append(False)
+    add("Profile match", "score_percent", "%", 1)
+    for column, stats in enumerate((selected, baseline), 1):
+        if stats["hard_block_violations"]:
+            records[-1][column] = "Infeasible"
+            records[-1][3] = "—"
+            worse[-1] = False
+    add("Data coverage", "coverage_percent", "%", 1)
+    add("Known soft conflicts", "conflict_count")
+    add("Missing information", "unknown_count")
+    add("Blocked traversals", "hard_block_violations")
+    for row in comparison["obstacle_rows"]:
+        if row["selected"] or row["standard"]:
+            delta = row["selected"] - row["standard"]
+            records.append([row["label"], str(row["selected"]), str(row["standard"]), f"{delta:+d}"])
+            worse.append(delta > 0)
+    table_height = (len(records) + 1) * .21
+    table = ax.table(cellText=records, colLabels=["Measure / encounters", "Selected", "Standard", "Change"],
+                     colWidths=[.43, .20, .20, .17], cellLoc="left", bbox=(0, 1 - (y + table_height) / height, 1, table_height / height))
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.set_gid("route-comparison-table")
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor("#e5e9ee")
+        cell.set_linewidth(.4)
+        cell.set_facecolor("#eef3f8" if row == 0 else "white" if row % 2 else "#f7f9fb")
+        if cell.get_text().get_text() == "No active score":
+            cell.PAD = .03  # Retain the complete label at 9pt within the numeric column.
+        if row == 0:
+            cell.get_text().set_weight("bold")
+            cell.get_text().set_color(_BLUE if column == 1 else _ORANGE if column == 2 else _NAVY)
+        elif cell.get_text().get_text() == "Infeasible" or column == 3 and worse[row - 1]:
+            cell.set_facecolor("#fce8e6")
+            cell.get_text().set_color(_RED)
+    y += table_height + .10
+    if baseline["hard_block_violations"]:
+        put("STANDARD INFEASIBLE under selected hard rules", bold=True, colour=_RED, gid="comparison-warning")
+    else:
+        put("Feasibility is under selected model rules, not a safety guarantee.", gid="comparison-warning")
+    put("Change = selected − standard; red marks worse, not all changes better.\n"
+        "All grouped encounters (not stair risers); full detail: route_summary.md",
+        gid="comparison-footer", advance=.32)
+    put("Standard: shortest mapped pedestrian distance; no soft weights,\n"
+        "wheelchair hard requirement or handrail preference. Access/direction rules\n"
+        "remain. Differences reflect hard rules as well as weights.", gid="comparison-baseline")
+
+
+def _comparison_profile_height(view: dict) -> float:
+    return .66 + max(1, (len(view.get("selected_preferences", [])) + 1) // 2) * .18 + .40
+
+
+def _comparison_height(view: dict) -> float:
+    obstacles = view.get("comparison", {}).get("obstacle_rows", [])
+    return _comparison_profile_height(view) + (8 + sum(bool(row["selected"] or row["standard"]) for row in obstacles)) * .21 + 1.02
+
+
+def _same_path(route: Route, standard: Route | None) -> bool:
+    return standard is not None and route.nodes == standard.nodes and tuple(
+        edge.id for edge in route.edges) == tuple(edge.id for edge in standard.edges)
+
+
 def _route_figure(graph: InMemoryGraph, route: Route, positions: Mapping[str, Point], rows: list[dict],
                   counts: dict[str, int], extent: Extent, presentation: dict | None,
-                  title: str, synthetic: bool) -> Figure:
-    figure = _figure(title, "Route & obstacles", synthetic, _ROUTE_SIZE)
+                  title: str, synthetic: bool, corridor: _Corridor,
+                  standard_route: Route | None = None) -> Figure:
+    summary_height = _comparison_height(presentation or {})
+    key_height = .40 + .26 * max(1, ceil(min(len(rows), _MAX_LABELS) / 2))
+    height = max(10, 2 * ceil((summary_height + key_height + .08) / (.77 * 2))) if standard_route is not None else 10
+    figure = _figure(title, "Route & obstacles", synthetic, (16, height))
     ax = figure.add_axes(_ROUTE_RECT, label="route-focus")
-    summary = figure.add_axes((.64, .43, .34, .49), label="route-summary")
-    inset = figure.add_axes((.665, .205, .13, .19), label="area-context")
-    key = figure.add_axes((.82, .205, .16, .23), label="obstacle-key")
-    _map_axes(ax, [positions[node] for node in route.nodes], "Route focus · exact stored geometry", extent=extent)
-    segments = _true_segments(graph.edges, positions)
-    _lines(ax, list(segments.values()), _GRAPH_GREY, "graph-edges", width=1.1, zorder=1)
+    if standard_route is not None:
+        bottom = .92 - summary_height / height
+        summary = figure.add_axes((.64, bottom, .34, summary_height / height), label="route-summary")
+        key = figure.add_axes((.64, bottom - (key_height + .08) / height, .34, key_height / height), label="obstacle-key")
+    else:
+        summary = figure.add_axes((.64, .43, .34, .49), label="route-summary")
+        key = figure.add_axes((.82, .205, .16, .20), label="obstacle-key")
+    title_note = " · same path" if _same_path(route, standard_route) else ""
+    _map_axes(ax, [positions[node] for node in route.nodes],
+              f"Route union · {corridor.radius_m:g} m corridor{title_note}", extent=extent)
+    ax.set_anchor("N")
+    segments = [segment for parts in corridor.segments.values() for segment in parts]
+    _lines(ax, segments, _GRAPH_GREY, "graph-edges", width=1.1, zorder=1)
     _obstacles(ax, rows, [positions[route.nodes[0]], positions[route.nodes[-1]]])
-    _summary_panel(summary, route, presentation)
+    if standard_route is None:
+        _summary_panel(summary, route, presentation)
+    else:
+        _comparison_panel(summary, presentation, route, standard_route)
     _marker_key(key, rows)
-    xmin, xmax, ymin, ymax = extent
-    _map_axes(inset, [*positions.values(), (xmin, ymin), (xmax, ymax)], "Area context")
-    inset.xaxis.set_major_locator(MaxNLocator(nbins=2))
-    inset.yaxis.set_major_locator(MaxNLocator(nbins=2))
-    _lines(inset, list(segments.values()), _GRAPH_GREY, "graph-edges", width=.8, zorder=1)
-    window = Rectangle((xmin, ymin), xmax - xmin, ymax - ymin, fill=False,
-                       edgecolor=_MAGENTA, linewidth=1.2, linestyle="--", zorder=4)
-    window.set_gid("focus-window")
-    inset.add_patch(window)
-    _route_line(inset, route, positions, width=1.8)
+    if standard_route is None:
+        inset = figure.add_axes((.665, .205, .13, .19), label="area-context")
+        _map_axes(inset, [], "Corridor context", extent=extent)
+        inset.xaxis.set_major_locator(MaxNLocator(nbins=2))
+        inset.yaxis.set_major_locator(MaxNLocator(nbins=2))
+        _lines(inset, segments, _GRAPH_GREY, "graph-edges", width=.8, zorder=1)
+        _route_line(inset, route, positions, width=1.8)
     # Foreground route is deliberately added after every background and marker.
     _route_line(ax, route, positions)
+    if standard_route is not None:
+        _standard_line(ax, standard_route, positions)
     _finish_route(ax, route, positions, _BLUE)
-    handles = [_route_key(_BLUE), _legend_line("Area context", _GRAPH_GREY),
-               _legend_line("Focus window (inset)", _MAGENTA, dashed=True)]
+    handles = [_route_key(_BLUE), _legend_line("Corridor context", _GRAPH_GREY)]
+    if standard_route is not None:
+        handles.append(Line2D([], [], color=_ORANGE, linestyle="--", marker=">",
+                              label="Standard (N) / travel direction"))
     for label, colour in (("Conflict / hard block", _RED), ("Other encounter", "#a26812"), ("Off-route feature", "#637184")):
         handles.append(Line2D([], [], linestyle="none", marker="o", markerfacecolor="none",
                               markeredgecolor=colour, label=label))
-    figure.legend(handles=handles, loc="lower center", bbox_to_anchor=(.52, .105), ncols=6, frameon=False, fontsize=9)
+    figure.legend(handles=handles, loc="lower center", bbox_to_anchor=(.52, .105), ncols=3, frameon=False, fontsize=9)
     figure.text(.065, .076,
                 f"Markers: {counts['selected_candidates']} selected / {counts['total_candidates']} candidates; "
                 f"{counts['cropped']} cropped; {counts['displayed']} displayed ({counts['labelled']} numbered); "
@@ -679,36 +1039,80 @@ def _route_figure(graph: InMemoryGraph, route: Route, positions: Mapping[str, Po
 
 
 def _accessibility_figure(graph: InMemoryGraph, route: Route, positions: Mapping[str, Point],
-                          scores: Mapping[str, _Score], title: str, synthetic: bool) -> Figure:
-    figure = _figure(title, "Area accessibility", synthetic, (16, 10))
-    left = figure.add_axes((.065, .215, .565, .675), label="area-scores")
-    right = figure.add_axes((.715, .215, .26, .675), label="route-detail")
-    shifted = score_segments(graph, positions)
-    extent = [*positions.values(), *(point for segment in shifted.values() for point in segment)]
-    _map_axes(left, extent, "Full selected area · all directed edges")
-    _map_axes(right, [positions[key] for key in route.nodes], "Route-only scores · exact geometry")
+                          scores: Mapping[str, _Score], title: str, synthetic: bool,
+                          corridor: _Corridor, standard_route: Route | None = None) -> Figure:
+    xmin, ymin, xmax, ymax = corridor.geometry.bounds
+    stacked = (xmax - xmin) / (ymax - ymin) > 1.8
+    height = 10.
+    left_rect, right_rect = (.065, .215, .40, .675), (.57, .215, .40, .675)
+    if stacked:
+        # Full-width equal panels with physical-inch gutters for titles, ticks
+        # and the footer. Derive height from the *padded* metric union: no empty
+        # square axes, stretching, or rotation of either route is necessary.
+        x0, x1, y0, y1 = corridor.extent
+        panel_height = 16 * .905 * (y1 - y0) / (x1 - x0)
+        height = 2 * panel_height + 4.2
+        left_rect = (.065, (2.15 + panel_height + .85) / height, .905, panel_height / height)
+        right_rect = (.065, 2.15 / height, .905, panel_height / height)
+    figure = _figure(title, "Area accessibility", synthetic, (16, height))
+    if stacked:
+        for text in figure.texts:
+            x, y = text.get_position()
+            text.set_position((x, 1 - (1 - y) * 10 / height))
+    left = figure.add_axes(left_rect, label="area-scores")
+    right = figure.add_axes(right_rect, label="route-detail")
+    _map_axes(left, [], "Selected route · selected-profile edge scores", extent=corridor.extent)
+    blocked_standard = standard_route is not None and any(scores[edge.id].blocked for edge in standard_route.edges)
+    right_title = ("No-preference standard" + (" · infeasible under selected rules" if blocked_standard else "")
+                   if standard_route is not None else "Route scores · standard route not supplied")
+    if _same_path(route, standard_route):
+        right_title += " · same path"
+    _map_axes(right, [], right_title, extent=corridor.extent)
     scale = ScalarMappable(norm=Normalize(vmin=0, vmax=100), cmap="cividis")
-    _score_lines(left, graph.edges, shifted, scores, scale, "graph")
-    _route_line(left, route, positions, colour=_MAGENTA, contrast=True, width=3.8)
-    _route_line(right, route, positions, colour=_NAVY, width=6)
-    _score_lines(right, route.edges, _true_segments(route.edges, positions), scores, scale, "path", width=3.6, zorder=13)
-    _finish_route(left, route, positions, _MAGENTA)
-    _finish_route(right, route, positions, _NAVY)
-    colour_axis = figure.add_axes((.30, .139, .40, .019), label="edge-score-scale")
+    true = _true_segments(graph.edges, positions)
+    shifted = _corridor_scores(graph, positions, corridor)
+    for ax in ((left, right) if standard_route is not None else (left,)):
+        _score_lines(ax, graph.edges, true, scores, scale, "graph", width=.8, clipped=shifted)
+    _route_line(left, route, positions, width=6)
+    if standard_route is not None:
+        _score_lines(left, route.edges, true, scores, scale, "path", width=3.2, zorder=13)
+    _finish_route(left, route, positions, _BLUE)
+    if standard_route is not None:
+        _standard_line(right, standard_route, positions)
+        blocked = [true[edge.id] for edge in standard_route.edges if scores[edge.id].blocked]
+        if blocked:
+            _lines(right, blocked, _RED, "standard-blocked", dashed=True, width=3.2, zorder=16)
+        _endpoints(right, standard_route, positions)
+    else:
+        _route_line(right, route, positions, width=6)
+        _score_lines(right, route.edges, true, scores, scale, "path", width=3.2, zorder=13)
+        _finish_route(right, route, positions, _BLUE)
+    colour_axis = figure.add_axes((.30, 1.39 / height, .40, .19 / height), label="edge-score-scale")
     colourbar = figure.colorbar(scale, cax=colour_axis, orientation="horizontal", ticks=[0, 25, 50, 75, 100])
     if colourbar.solids is not None:
         colourbar.solids.set_rasterized(False)  # Matplotlib otherwise rasterizes continuous colourbars in PDF.
     colourbar.set_ticklabels(["0 (low)", "25", "50", "75", "100 (high)"])
     colourbar.set_label("Event-inclusive edge score (0-100)", fontsize=9)
     colourbar.ax.tick_params(labelsize=9)
-    figure.legend(handles=[_route_key(_MAGENTA, dashed=True), _legend_line("Hard-blocked direction", _RED, dashed=True),
-                           _legend_line("No active scored exposure", _GREY)],
-                  loc="lower center", bbox_to_anchor=(.52, .064), ncols=3, frameon=False, fontsize=9)
-    figure.text(.065, .044,
-                f"All {len(graph.edges)} directed edges retained; coincident-edge offsets ≤{_OFFSET_M:g} m in area colours only "
-                "(not real geometry). Route unshifted; detail uses identical event-inclusive scores.", fontsize=9)
-    figure.text(.065, .023, _caption(synthetic), fontsize=9)
+    handles = [_route_key(_BLUE), _legend_line("Hard-blocked direction", _RED, dashed=True),
+               _legend_line("No active scored exposure", _GREY)]
+    if standard_route is not None:
+        handles.insert(1, _legend_line("No-preference standard", _ORANGE, dashed=True))
+    figure.legend(handles=handles, loc="lower center", bbox_to_anchor=(.52, .64 / height), ncols=4, frameon=False, fontsize=9)
+    figure.text(.065, .48 / height,
+                f"{len(corridor.segments)} of {len(graph.edges)} directed edges intersect the {corridor.radius_m:g} m route-union corridor. "
+                "Full diagnostics retained; identical selected-profile score scale in both panels.", fontsize=9)
+    figure.text(.065, .30 / height, "Coincident background directions offset by ≤1 m for visibility, then clipped to the same corridor; "
+                "selection uses original geometry. Route traces stay exact.", fontsize=9)
+    figure.text(.065, .12 / height, _caption(synthetic), fontsize=9)
     return figure
+
+
+def _validated_radius(value: object) -> float:
+    radius = _number(value, "corridor_radius_m")
+    if not 0 < radius <= 5000:
+        raise ValueError("corridor_radius_m must be > 0 and <= 5000 metres")
+    return radius
 
 
 def create_figures(
@@ -721,6 +1125,8 @@ def create_figures(
     synthetic: bool,
     output_dir: Path,
     presentation: dict | None = None,
+    standard_route: Route | None = None,
+    corridor_radius_m: float = 150.0,
     file_formats: tuple[str, ...] = ("png",),
     dpi: int = 240,
 ) -> list[Path]:
@@ -732,9 +1138,15 @@ def create_figures(
     unblocked None score is grey (no active criteria or scored exposure).
 
     presentation is the output-only build_route_presentation dictionary. Its
-    already-filtered map_obstacles are cropped, coalesced and capped for display;
+    already-filtered map_obstacles and relevant standard encounters share a cap;
     no diagnostics, metrics, geometry or complete encounter lists are changed.
     Without it, old POI callers get stairs / blocked barriers, at most 12 markers.
+    standard_route is the supplied no-preference trace, never reconstructed or
+    shifted. None supports archived selected-only runs without a fake comparison.
+    Both maps clip context to the union of route buffers in a route-centred AEQD
+    projection. corridor_radius_m must be finite, positive and at most 5000 m.
+    Only coincident background score segments are offset (at most 1 m), then
+    clipped back to that same corridor; membership uses original geometry.
     No observations are inferred from unknowns. Only PNG and PDF are accepted.
     Inputs are not mutated. Existing targets (including symbolic links) fail
     before writing; exclusive file creation also protects against races. Files
@@ -757,8 +1169,15 @@ def create_figures(
             raise FileExistsError(f"Refusing to overwrite existing plot: {path}")
     scores = _validated_scores(graph, diagnostics)
     _validate_route(graph, route)
-    positions, transformer = _project_graph(graph)
-    rows, counts, extent = _select_obstacles(pois, presentation, transformer, [positions[key] for key in route.nodes])
+    radius = _validated_radius(corridor_radius_m)
+    if standard_route is not None:
+        _validate_route(graph, standard_route)
+    routes = [route] + ([standard_route] if standard_route is not None else [])
+    positions, transformer = _project_graph(graph, [node for path in routes for node in path.nodes])
+    paths_in_metres = [[positions[key] for key in path.nodes] for path in routes]
+    corridor = _corridor(graph, positions, paths_in_metres, radius)
+    rows, counts, extent = _select_obstacles(pois, _comparison_markers(presentation, standard_route), transformer,
+                                             paths_in_metres[0], paths=paths_in_metres, corridor=corridor)
     if presentation is not None and "synthetic" in presentation:
         if not isinstance(presentation["synthetic"], bool):
             raise ValueError("presentation synthetic must be a boolean")
@@ -767,8 +1186,10 @@ def create_figures(
     created: list[Path] = []
     try:
         with rc_context({"font.family": "DejaVu Sans", "font.size": 10, "pdf.fonttype": 42, "text.usetex": False}):
-            figures.append(_route_figure(graph, route, positions, rows, counts, extent, presentation, title, synthetic))
-            figures.append(_accessibility_figure(graph, route, positions, scores, title, synthetic))
+            figures.append(_route_figure(graph, route, positions, rows, counts, extent, presentation, title, synthetic,
+                                         corridor, standard_route))
+            figures.append(_accessibility_figure(graph, route, positions, scores, title, synthetic, corridor,
+                                                 standard_route))
             output_dir.mkdir(parents=True, exist_ok=True)
             with ExitStack() as stack:
                 files = {}

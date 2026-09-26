@@ -24,6 +24,7 @@ from .evaluation import MODEL_VERSION, Evaluator
 from .models import Coordinate, Route
 from .outputs import (
     PresentationOptions,
+    build_route_comparison,
     build_route_presentation,
     collect_pois,
     edge_diagnostics,
@@ -72,7 +73,7 @@ def scientific_fingerprint() -> str:
 
 def environment_record() -> dict:
     dependencies = {}
-    for name in ("pymongo", "matplotlib", "pyproj", "defusedxml", "ijson"):
+    for name in ("pymongo", "matplotlib", "pyproj", "shapely", "defusedxml", "ijson"):
         try:
             dependencies[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -112,17 +113,51 @@ def compare_baselines(graph, start: str, goal: str, profile: Profile, parameters
     return runs
 
 
+def _standard_profile() -> Profile:
+    return Profile(name="No preferences", weights={}, wheelchair_required=False, prefer_handrail=False)
+
+
+def _corridor_radius(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 5000:
+        raise DataError("corridor_radius_m must be finite, greater than 0 and at most 5000 metres")
+    return float(value)
+
+
+def _stored_standard(graph, selected: Route, record: dict, parameters: CostParameters) -> Route:
+    """Reconstruct and check the archived trace, not a new route on replot."""
+    profile = _standard_profile()
+    if record["profile"] != profile.as_dict() or record["objective"] != "distance_only":
+        raise DataError("Invalid no-preference baseline definition")
+    summary = record["route"]
+    if summary["algorithm"] not in {"astar", "dijkstra"}:
+        raise DataError("Invalid standard search algorithm")
+    edges = {edge.id: edge for edge in graph.edges}
+    route = Route(tuple(summary["node_ids"]), tuple(edges[key] for key in summary["edge_ids"]),
+                  summary["distance_m"], summary["optimized_cost_m"], algorithm=summary["algorithm"])
+    if (route.nodes[0], route.nodes[-1]) != (selected.nodes[0], selected.nodes[-1]):
+        raise DataError("Standard route must use the same snapped endpoints")
+    recomputed = route_summary(route, Evaluator(profile, parameters))
+    for key in ("profile_cost_m", "score_percent", "coverage_percent", "hard_block_violations"):
+        if recomputed[key] != summary[key]:
+            raise DataError("Standard route metrics do not match the recorded graph")
+    if not math.isclose(route.cost, route.distance_m, rel_tol=1e-10, abs_tol=1e-6):
+        raise DataError("Standard route objective must equal mapped distance")
+    return route
+
+
 def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile: Profile,
                    parameters: CostParameters, output_dir: str | Path, *, algorithm: str = "astar",
                    snap_distance_m: float = 150, plots: bool = True, baselines: bool = True,
                    file_formats: tuple[str, ...] = ("png",),
-                   presentation_options: PresentationOptions | None = None, detailed: bool = False) -> dict:
+                   presentation_options: PresentationOptions | None = None, detailed: bool = False,
+                   corridor_radius_m: float = 150.0) -> dict:
     output = Path(output_dir)
     if output.exists() or output.is_symlink():
         raise DataError("Output directory already exists. Use a new run directory to preserve previous results")
     options = presentation_options or PresentationOptions()
     if not isinstance(options, PresentationOptions):
         raise DataError("presentation_options must be PresentationOptions")
+    radius = _corridor_radius(corridor_radius_m)
     graph = dataset.graph()
     if not graph.edges:
         raise DataError("Dataset produced no routing graph")
@@ -131,11 +166,15 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
     # Exclude snapping and full-graph diagnostics from the reported search time.
     evaluator = Evaluator(profile, parameters)
     route = find_route(graph, start_snap.node_id, end_snap.node_id, evaluator, algorithm)
+    standard_profile = _standard_profile()
+    standard_evaluator = Evaluator(standard_profile, parameters)
+    standard_route = find_route(graph, start_snap.node_id, end_snap.node_id, standard_evaluator,
+                                algorithm, distance_only=True)
     comparisons = compare_baselines(graph, start_snap.node_id, end_snap.node_id, profile, parameters) if baselines else {}
     diagnostics = edge_diagnostics(graph, route, evaluator)
     pois = collect_pois(graph, route, diagnostics)
     manifest = {
-        "format_version": 2, "model_version": MODEL_VERSION, "created_utc": datetime.now(timezone.utc).isoformat(),
+        "format_version": 3, "model_version": MODEL_VERSION, "created_utc": datetime.now(timezone.utc).isoformat(),
         "environment": environment_record(), "source_revision": revision_record(),
         "dataset": dataset.metadata | {"sha256": dataset.fingerprint(), "counts": dataset.counts()},
         "graph_sha256": graph_fingerprint(graph), "graph_counts": {"nodes": len(graph.nodes), "directed_edges": len(graph.edges)},
@@ -143,6 +182,8 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
         "profile_sha256": hashlib.sha256(canonical_json(profile.as_dict()).encode()).hexdigest(),
         "snapping": {"start": start_snap.as_dict(), "end": end_snap.as_dict(), "max_distance_m": snap_distance_m},
         "route": route_summary(route, evaluator), "baselines": comparisons,
+        "standard_route": {"objective": "distance_only", "profile": standard_profile.as_dict(),
+                   "route": route_summary(standard_route, standard_evaluator)},
         "graph_blocked_directed_edges": sum(item["blocked"] for item in diagnostics.values()),
         "pois_on_route": [poi["id"] for poi in pois if poi["on_route"]],
         "limitations": ["Scores are heuristic preference matches, not measured accessibility or safety probabilities.",
@@ -153,10 +194,15 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
     presentation = build_route_presentation(
         graph, route, diagnostics, profile, parameters, options=options, baselines=comparisons,
         snapping=manifest["snapping"], synthetic=bool(dataset.metadata.get("synthetic", False)),
+        include_context=False,
+    )
+    presentation["comparison"] = build_route_comparison(
+        graph, route, standard_route, diagnostics, profile, parameters, selected_presentation=presentation,
     )
     manifest["presentation"] = presentation
     manifest["output"] = {"mode": "compact", "detailed": detailed, "file_formats": list(file_formats) if plots else [],
-                          "options": options.as_dict(), "archive": ARCHIVE_NAME}
+                          "options": options.as_dict(), "archive": ARCHIVE_NAME, "corridor_radius_m": radius,
+                          "marker_scope": "selected_and_standard_routes"}
     output.mkdir(parents=True, exist_ok=False)
     # Keep all reproducibility evidence together, not spread across the result folder.
     with TemporaryDirectory(prefix=".archive-work-", dir=output) as staging_name:
@@ -173,7 +219,8 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
             from .visualization import create_figures
             create_figures(graph, route, diagnostics, pois, title=f"{profile.name}; factor={parameters.accessibility_factor:g}",
                            synthetic=bool(dataset.metadata.get("synthetic", False)), output_dir=output,
-                           file_formats=file_formats, presentation=presentation)
+                           file_formats=file_formats, presentation=presentation,
+                           standard_route=standard_route, corridor_radius_m=radius)
         manifest["artifact_sha256"] = {path.name: sha256_file(path) for path in sorted(staging.iterdir())}
         manifest["deliverable_sha256"] = {path.name: sha256_file(path) for path in sorted(output.iterdir()) if path.is_file()}
         write_json(staging / "manifest.json", manifest)
@@ -188,7 +235,7 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
         try:
             with archive_path.open("xb") as stream:
                 created = True
-                with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
+                with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=1) as archive:
                     for path in sorted(staging.iterdir()):
                         archive.write(path, arcname=path.name)
         except BaseException:
@@ -228,7 +275,7 @@ def _read_saved_inputs(root: Path) -> tuple[dict, dict]:
             ) > 2 * 1024**3:
                 raise DataError("Encrypted or excessively large research archive")
             manifest = json.loads(archive.read("manifest.json"))
-            if manifest.get("format_version") != 2:
+            if manifest.get("format_version") not in {2, 3}:
                 raise DataError("Unsupported compact archive version")
             hashes = _validate_hashes(manifest["artifact_sha256"], ARCHIVE_ARTIFACTS)
             if set(hashes) != ARCHIVE_ARTIFACTS:
@@ -308,6 +355,13 @@ def load_run(run_dir: str | Path):
             snap = manifest["snapping"][label]
             if snap["node_id"] != node_id or snap["snapped_lat_lon"] != graph.nodes[node_id].coordinate.as_lat_lon():
                 raise DataError("Saved snap endpoint does not match the route")
+        if manifest["format_version"] == 3:
+            standard = _stored_standard(graph, route, manifest["standard_route"], evaluator.parameters)
+            _corridor_radius(manifest["output"]["corridor_radius_m"])
+            diagnostics = edge_diagnostics(graph, route, evaluator)
+            comparison = build_route_comparison(graph, route, standard, diagnostics, profile, evaluator.parameters)
+            if comparison != manifest["presentation"]["comparison"]:
+                raise DataError("Saved route comparison does not match its recorded paths/profile")
         return dataset, graph, route, evaluator, manifest
     except DataError:
         raise
@@ -321,7 +375,7 @@ def re_safe_name(name: str) -> bool:
 
 def replot(run_dir: str | Path, output_dir: str | Path, file_formats: tuple[str, ...] = ("png",), *,
            presentation_options: PresentationOptions | None = None,
-           presentation_overrides: dict | None = None) -> list[Path]:
+           presentation_overrides: dict | None = None, corridor_radius_m: float | None = None) -> list[Path]:
     from .visualization import create_figures
     dataset, graph, route, evaluator, manifest = load_run(run_dir)
     if presentation_options is not None and presentation_overrides:
@@ -329,18 +383,29 @@ def replot(run_dir: str | Path, output_dir: str | Path, file_formats: tuple[str,
     options = presentation_options or PresentationOptions.from_dict(
         manifest.get("output", {}).get("options", {}) | (presentation_overrides or {})
     )
+    radius = _corridor_radius(corridor_radius_m if corridor_radius_m is not None else
+                              manifest.get("output", {}).get("corridor_radius_m", 150.0))
+    standard = (_stored_standard(graph, route, manifest["standard_route"], evaluator.parameters)
+                if manifest.get("format_version") == 3 else None)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
     diagnostics = edge_diagnostics(graph, route, evaluator)
     presentation = build_route_presentation(
         graph, route, diagnostics, evaluator.profile, evaluator.parameters, options=options,
         baselines=manifest["baselines"], snapping=manifest["snapping"], synthetic=bool(dataset.metadata.get("synthetic", False)),
+        include_context=standard is None,
     )
+    if standard is not None:
+        presentation["comparison"] = build_route_comparison(
+            graph, route, standard, diagnostics, evaluator.profile, evaluator.parameters,
+            selected_presentation=presentation,
+        )
     with (output / "route_summary.md").open("x", encoding="utf-8") as stream:
         stream.write(render_route_summary(presentation))
     return create_figures(graph, route, diagnostics, collect_pois(graph, route, diagnostics), title=evaluator.profile.name,
                           synthetic=bool(dataset.metadata.get("synthetic", False)), output_dir=output,
-                          file_formats=file_formats, presentation=presentation)
+                          file_formats=file_formats, presentation=presentation,
+                          standard_route=standard, corridor_radius_m=radius)
 
 
 def parameter_sweep(run_dir: str | Path, output_dir: str | Path, factors: list[float], unknown_risks: list[float], repeats: int = 3) -> dict:
