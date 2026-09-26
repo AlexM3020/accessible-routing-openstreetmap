@@ -1,0 +1,5 @@
+- A Python toolkit links pedestrian preferences to auditable directed routes.
+- Hard restrictions, weighted concerns and unknown observations remain distinct.
+- Standard and selected routes are assessed under the same preference model.
+- Exact traces and corridor-focused figures accompany reproducibility archives.
+- Automated tests check comparison semantics, geometry and archive integrity.

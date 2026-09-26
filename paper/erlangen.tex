@@ -1,0 +1,68 @@
+% Replace this subsection with the completed study, not merely a populated table.
+% Keep observed field facts separate from model outputs and synthetic results.
+\subsection{Erlangen, Germany: local evaluation to be completed}
+\label{sec:erlangen}
+\AuthorQuery{Insert the actual Erlangen study design, results and interpretation
+here. No local field measurements or city-scale performance results were
+provided for this draft. The following is an evaluation plan and reporting
+scaffold, not a claim that these procedures have already been performed.}
+
+The local evaluation will examine route comparisons on a fixed OSM extract
+covering the selected study area in Erlangen, Germany. The report should
+identify the extraction date, geographic boundary, input checksum, graph size
+and any preprocessing. Origin--destination pairs should be specified using
+an auditable sampling rule, rather than choosing only favourable examples.
+Both successful and failed requests, including snapping failures, should be
+reported. The approximately 2~km case motivating the output redesign can be
+included, but its actual route, observations and timing must be supplied.
+
+For each successful request, compare the selected route with both the
+no-preference standard and the distance-only route under matched hard
+constraints. Keep endpoints, input snapshot and assessment profile fixed.
+Report distance, grouped feature encounters, known preference conflicts,
+unknown observations, coverage and feasibility; score differences are defined
+only for feasible routes under the same measuring rule. Distinguish
+model-reported obstacles from independently audited physical features, using
+a stated correspondence rule between audited features and OSM elements.
+Audit dates, measurement methods, accessible alternatives and uncertainty
+should accompany any assertion about physical suitability. Do not ask a
+participant to traverse an alternative that violates their requirements merely
+to complete a comparison.
+
+Runtime evaluation should separate loading, graph construction, search,
+diagnostics, figures and archive creation, and record hardware, software
+versions, cold and warm conditions, repetitions and memory-measurement methods.
+Summaries should retain the paired structure, state their denominators and
+show variability. If repeated requests or several profiles share an
+origin--destination pair, uncertainty estimates must not treat those
+observations as independent without justification.
+
+\begin{table}[!ht]
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.43\textwidth}Y@{}}
+\toprule
+\textbf{Required Erlangen information} & \textbf{Author-supplied result} \\
+\midrule
+Study boundary; extract date/hash; nodes/edges & \Pending \\
+Route-pair selection; requested/successful/failed counts & \Pending \\
+Profiles, hard requirements and cost parameters & \Pending \\
+Independent audit method, dates and feature correspondence & \Pending \\
+Paired distances, encounters, conflicts and unknowns & \Pending \\
+Feasibility and common-profile scores/coverage & \Pending \\
+Runtime/memory, hardware, repetitions and variability & \Pending \\
+Field agreement, uncertainty and unfavourable cases & \Pending \\
+Data availability, OSM attribution and privacy safeguards & \Pending \\
+\bottomrule
+\end{tabularx}
+\caption{Placeholder for the Erlangen evaluation. ``Pending'' means no result
+has been supplied; it does not mean zero, no obstacle, or a successful test.}
+\label{tab:erlangen}
+\end{table}
+
+\AuthorQuery{Replace the plan with what was actually done and report the
+results, including null or adverse findings. Add an appropriately attributed
+Erlangen map only after choosing the real study area. If participants,
+identifiable locations or personal mobility data were involved, state the
+applicable ethics approval or exemption, consent and privacy arrangements;
+do not claim approval or exemption without verification. Update the abstract,
+impact and conclusions to reflect only the supplied evidence.}
