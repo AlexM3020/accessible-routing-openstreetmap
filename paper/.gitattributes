@@ -1,0 +1,8 @@
+# The provenance file hashes the generated table bytes. Keep them stable on checkout.
+*.tex text eol=lf
+*.bib text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.pdf binary
