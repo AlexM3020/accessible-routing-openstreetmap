@@ -7,6 +7,7 @@ from pymongo.errors import OperationFailure
 
 from osm_accessibility.cli import main
 from osm_accessibility.errors import DatabaseError, DataError
+from osm_accessibility.experiment import load_run
 from osm_accessibility.mongo import connect
 
 
@@ -41,8 +42,8 @@ def test_command_pipeline_local_upload_and_snapshot_routing(tmp_path, monkeypatc
     route_args = ["--start", "49.58", "11", "--end", "49.58", "11.001", "--profile-file", str(profile), "--no-plots"]
     assert main(["route", "--osm", str(path), *route_args, "--output", str(tmp_path / "local")]) == 0
     assert main(["route", "--dataset", "study", *route_args, "--output", str(tmp_path / "mongo")]) == 0
-    local = json.loads((tmp_path / "local" / "manifest.json").read_text(encoding="utf-8"))
-    remote = json.loads((tmp_path / "mongo" / "manifest.json").read_text(encoding="utf-8"))
+    local = load_run(tmp_path / "local")[-1]
+    remote = load_run(tmp_path / "mongo")[-1]
     assert local["graph_sha256"] == remote["graph_sha256"]
     assert local["route"]["edge_ids"] == remote["route"]["edge_ids"]
     assert main(["plot", str(tmp_path / "local"), "--output", str(tmp_path / "plots"), "--format", "png"]) == 0
@@ -91,3 +92,18 @@ def test_no_missing_credentials_or_system_database_writes(monkeypatch):
         with pytest.raises(DataError):
             with connect(name):
                 pass
+
+
+def test_marker_controls_json_and_replot_inheritance(tmp_path, capsys):
+    output = tmp_path / "controlled"
+    assert main(["demo", "--output", str(output), "--no-plots", "--obstacles", "stairs",
+                 "--max-markers", "4", "--details", "--json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["output"]["options"] == {"obstacle_kinds": ["stairs"], "max_markers": 4}
+    assert (output / "diagnostics" / "manifest.json").exists()
+    assert main(["plot", str(output), "--output", str(tmp_path / "redrawn"), "--max-markers", "2"]) == 0
+    summary = (tmp_path / "redrawn" / "route_summary.md").read_text(encoding="utf-8")
+    assert "Explicit types: Stairs" in summary and "Marker limit: 2" in summary
+    assert main(["demo", "--output", str(tmp_path / "invalid"), "--no-plots",
+                 "--obstacles", "auto", "stairs"]) == 1
+    assert not (tmp_path / "invalid").exists()

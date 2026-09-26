@@ -13,6 +13,7 @@ from .errors import ResearchError
 from .experiment import parameter_sweep, replot, run_experiment
 from .models import Coordinate
 from .mongo import connect, import_dataset, load_dataset
+from .outputs import OBSTACLE_KINDS, PresentationOptions
 from .profiles import CostParameters, Profile, profile_named
 
 
@@ -32,7 +33,10 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--algorithm", choices=("astar", "dijkstra"), default="astar")
         command.add_argument("--no-plots", action="store_true")
         command.add_argument("--no-baselines", action="store_true")
-        command.add_argument("--format", choices=("png", "pdf", "both"), default="both")
+        command.add_argument("--format", choices=("png", "pdf", "both"), default="png")
+        command.add_argument("--details", action="store_true", help="Also expand raw CSV/JSON evidence into diagnostics/")
+        command.add_argument("--json", action="store_true", help="Print full run metadata instead of a brief summary")
+        _presentation_arguments(command)
     source = route.add_mutually_exclusive_group(required=True)
     source.add_argument("--osm", type=Path)
     source.add_argument("--dataset", help="Named ready snapshot in MongoDB")
@@ -47,7 +51,8 @@ def parser() -> argparse.ArgumentParser:
     plotting = commands.add_parser("plot", help="Replot an archived run after fingerprint verification")
     plotting.add_argument("run", type=Path)
     plotting.add_argument("--output", type=Path, required=True)
-    plotting.add_argument("--format", choices=("png", "pdf", "both"), default="both")
+    plotting.add_argument("--format", choices=("png", "pdf", "both"), default="png")
+    _presentation_arguments(plotting)
     sweep = commands.add_parser("sweep", help="Compare algorithms, trade-off factors and unknown-data assumptions")
     sweep.add_argument("run", type=Path)
     sweep.add_argument("--output", type=Path, required=True)
@@ -59,10 +64,66 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _presentation_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--obstacles", nargs="+", choices=("auto", "all", "none", *OBSTACLE_KINDS),
+                         help="Marker types only, e.g. stairs barrier kerb; auto is important/preference-relevant features")
+    command.add_argument("--max-markers", type=int, default=None, help="Map marker budget, default 12 (0-100); complete report is never truncated")
+
+
+def _presentation_overrides(args) -> dict:
+    kinds = args.obstacles
+    values = {}
+    if kinds is None:
+        pass
+    elif kinds == ["auto"]:
+        selected = None
+        values["obstacle_kinds"] = selected
+    elif kinds == ["all"]:
+        values["obstacle_kinds"] = list(OBSTACLE_KINDS)
+    elif kinds == ["none"]:
+        values["obstacle_kinds"] = []
+    else:
+        if any(kind in {"all", "auto", "none"} for kind in kinds):
+            raise ValueError("Use auto/all/none alone, or select individual obstacle types")
+        values["obstacle_kinds"] = kinds
+    if args.max_markers is not None:
+        values["max_markers"] = args.max_markers
+    return values
+
+
+def _presentation_options(args) -> PresentationOptions:
+    return PresentationOptions.from_dict(_presentation_overrides(args))
+
+
+def _print_result(manifest: dict, output: Path) -> None:
+    view = manifest["presentation"]
+    metrics = view["metrics"]
+    score = "not defined" if metrics["score_percent"] is None else f"{metrics['score_percent']:.1f}%"
+    coverage = "not defined" if metrics["coverage_percent"] is None else f"{metrics['coverage_percent']:.1f}%"
+    print("SYNTHETIC EXAMPLE — not observed map conditions" if view["synthetic"] else "Route result — based on recorded map data")
+    print(f"Profile: {view['profile_name']} | Distance: {metrics['distance_m']:.1f} m | Match: {score} | Coverage: {coverage}")
+    selected = "; ".join(f"{item['label']} ({item['weight']:g})" for item in view["selected_preferences"])
+    print("Selected preferences: " + (selected or "none"))
+    print(f"Known preference conflicts: {len(view['conflicts'])}; unknown observations: {len(view['unknowns'])}")
+    encounters = view["encountered_obstacles"]
+    for item in encounters[:8]:
+        flag = "PREFERENCE CONFLICT" if item["preference_labels"] else "Encountered"
+        print(f"  [{flag}] {item['label']} — {item['location']}")
+    if len(encounters) > 8:
+        print(f"  {len(encounters) - 8} further encounters are listed in route_summary.md")
+    checks = view["validation"]
+    agreement = checks["astar_dijkstra_agree"]
+    comparison = "costs agree" if agreement is True else "COSTS DISAGREE" if agreement is False else "not compared"
+    print(f"Model checks: {checks['hard_constraint_violations']} hard-block violations; A*/Dijkstra {comparison}.")
+    print("These checks concern the graph and cost model, not physical safety or mapping completeness.")
+    print(f"Read: {output / 'route_summary.md'}\nGPX: {output / 'route.gpx'}\nReproduction: {output / 'reproducibility.zip'}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        formats = ("png", "pdf") if getattr(args, "format", "both") == "both" else (args.format,)
+        format_name = getattr(args, "format", "png")
+        formats = ("png", "pdf") if format_name == "both" else (format_name,)
         if args.command == "query":
             south, west, north, east = args.bbox
             Coordinate(south, west)
@@ -82,8 +143,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, indent=2))
             return 0
         if args.command == "plot":
-            paths = replot(args.run, args.output, formats)
-            print(f"Saved {len(paths)} figures to {args.output}")
+            paths = replot(args.run, args.output, formats, presentation_overrides=_presentation_overrides(args))
+            print(f"Saved {len(paths)} maps and route_summary.md to {args.output}")
             return 0
         if args.command == "sweep":
             record = parameter_sweep(args.run, args.output, args.factors, args.unknown_risks, args.repeats)
@@ -104,9 +165,12 @@ def main(argv: list[str] | None = None) -> int:
             start, end = Coordinate.from_lat_lon(args.start), Coordinate.from_lat_lon(args.end)
         manifest = run_experiment(dataset, start, end, profile, parameters, args.output,
                                   algorithm=args.algorithm, snap_distance_m=args.snap_distance,
-                                  plots=not args.no_plots, baselines=not args.no_baselines, file_formats=formats)
-        print(json.dumps({"output": str(args.output), "synthetic": dataset.metadata.get("synthetic", False),
-                          "graph_sha256": manifest["graph_sha256"], "route": manifest["route"]}, indent=2))
+                                  plots=not args.no_plots, baselines=not args.no_baselines, file_formats=formats,
+                                  presentation_options=_presentation_options(args), detailed=args.details)
+        if args.json:
+            print(json.dumps(manifest, indent=2))
+        else:
+            _print_result(manifest, args.output)
         return 0
     except (ResearchError, OSError, ValueError) as exc:
         # DatabaseError already sanitizes driver errors. No URI command-line option.

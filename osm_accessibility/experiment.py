@@ -9,10 +9,13 @@ import json
 import math
 import platform
 import re
+import shutil
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 from . import __version__
 from .data import Dataset, canonical_json, sha256_file
@@ -20,9 +23,12 @@ from .errors import DataError, NoRouteFound
 from .evaluation import MODEL_VERSION, Evaluator
 from .models import Coordinate, Route
 from .outputs import (
+    PresentationOptions,
+    build_route_presentation,
     collect_pois,
     edge_diagnostics,
     graph_fingerprint,
+    render_route_summary,
     route_summary,
     save_diagnostics,
     write_json,
@@ -34,12 +40,33 @@ REQUIRED_ARTIFACTS = frozenset({
     "dataset.json", "route.gpx", "route.geojson", "route_segments.csv", "all_edges.csv",
     "criteria.csv", "edge_diagnostics.json", "pois.csv", "pois.json",
 })
+ARCHIVE_NAME = "reproducibility.zip"
+ARCHIVE_ARTIFACTS = REQUIRED_ARTIFACTS | {"route_summary.md", "presentation.json"}
+SCIENCE_FILES = frozenset({
+    "builder.py", "data.py", "evaluation.py", "geo.py", "graph.py", "models.py", "profiles.py",
+    "routing.py", "tags.py",
+})
+# Version 0.1.0's core was verified unchanged during this presentation migration.
+# Unknown older implementations still fail instead of silently changing a study.
+LEGACY_IMPLEMENTATIONS = {
+    "48c3d801de7ad72924c28fde02d5c5f8194ce996bfe2810b0bb3daad7c3823e6":
+        "ef69ad5f613476c4e92a60e718a9cf564ac6c3cf9847c7947fd21bf2e36d6362",
+}
 
 
 def implementation_fingerprint() -> str:
     digest = hashlib.sha256()
     for path in sorted(Path(__file__).parent.glob("*.py")):
         digest.update(path.name.encode() + b"\0" + path.read_bytes().replace(b"\r\n", b"\n"))
+    return digest.hexdigest()
+
+
+def scientific_fingerprint() -> str:
+    """Presentation edits may change; routing/data/model code must remain identical."""
+    digest = hashlib.sha256()
+    for name in sorted(SCIENCE_FILES):
+        path = Path(__file__).parent / name
+        digest.update(name.encode() + b"\0" + path.read_bytes().replace(b"\r\n", b"\n"))
     return digest.hexdigest()
 
 
@@ -56,7 +83,8 @@ def environment_record() -> dict:
                 (distribution.metadata["Name"], distribution.version)
                 for distribution in importlib.metadata.distributions() if distribution.metadata.get("Name")
             )),
-            "implementation_sha256": implementation_fingerprint()}
+            "implementation_sha256": implementation_fingerprint(),
+            "scientific_sha256": scientific_fingerprint()}
 
 
 def revision_record() -> dict:
@@ -87,10 +115,14 @@ def compare_baselines(graph, start: str, goal: str, profile: Profile, parameters
 def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile: Profile,
                    parameters: CostParameters, output_dir: str | Path, *, algorithm: str = "astar",
                    snap_distance_m: float = 150, plots: bool = True, baselines: bool = True,
-                   file_formats: tuple[str, ...] = ("png", "pdf")) -> dict:
+                   file_formats: tuple[str, ...] = ("png",),
+                   presentation_options: PresentationOptions | None = None, detailed: bool = False) -> dict:
     output = Path(output_dir)
-    if output.exists():
+    if output.exists() or output.is_symlink():
         raise DataError("Output directory already exists. Use a new run directory to preserve previous results")
+    options = presentation_options or PresentationOptions()
+    if not isinstance(options, PresentationOptions):
+        raise DataError("presentation_options must be PresentationOptions")
     graph = dataset.graph()
     if not graph.edges:
         raise DataError("Dataset produced no routing graph")
@@ -103,7 +135,7 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
     diagnostics = edge_diagnostics(graph, route, evaluator)
     pois = collect_pois(graph, route, diagnostics)
     manifest = {
-        "format_version": 1, "model_version": MODEL_VERSION, "created_utc": datetime.now(timezone.utc).isoformat(),
+        "format_version": 2, "model_version": MODEL_VERSION, "created_utc": datetime.now(timezone.utc).isoformat(),
         "environment": environment_record(), "source_revision": revision_record(),
         "dataset": dataset.metadata | {"sha256": dataset.fingerprint(), "counts": dataset.counts()},
         "graph_sha256": graph_fingerprint(graph), "graph_counts": {"nodes": len(graph.nodes), "directed_edges": len(graph.edges)},
@@ -118,35 +150,129 @@ def run_experiment(dataset: Dataset, start: Coordinate, end: Coordinate, profile
                         "Snapping gaps are not verified and are excluded from GPX and distance.",
                         "Search timing excludes ingestion, snapping, diagnostics and plotting."],
     }
+    presentation = build_route_presentation(
+        graph, route, diagnostics, profile, parameters, options=options, baselines=comparisons,
+        snapping=manifest["snapping"], synthetic=bool(dataset.metadata.get("synthetic", False)),
+    )
+    manifest["presentation"] = presentation
+    manifest["output"] = {"mode": "compact", "detailed": detailed, "file_formats": list(file_formats) if plots else [],
+                          "options": options.as_dict(), "archive": ARCHIVE_NAME}
     output.mkdir(parents=True, exist_ok=False)
-    write_json(output / "dataset.json", {"format_version": 1, "metadata": dataset.metadata,
-                                         "elements": list(dataset.elements())})
-    save_diagnostics(output, graph, route, diagnostics, pois)
-    if plots:
-        from .visualization import create_figures
-        create_figures(graph, route, diagnostics, pois, title=f"{profile.name}; factor={parameters.accessibility_factor:g}",
-                       synthetic=bool(dataset.metadata.get("synthetic", False)), output_dir=output, file_formats=file_formats)
-    manifest["artifact_sha256"] = {path.name: sha256_file(path) for path in sorted(output.iterdir()) if path.is_file()}
-    write_json(output / "manifest.json", manifest)  # Written last: only a completed run has this file.
+    # Keep all reproducibility evidence together, not spread across the result folder.
+    with TemporaryDirectory(prefix=".archive-work-", dir=output) as staging_name:
+        staging = Path(staging_name)
+        write_json(staging / "dataset.json", {"format_version": 1, "metadata": dataset.metadata,
+                                             "elements": list(dataset.elements())})
+        save_diagnostics(staging, graph, route, diagnostics, pois)
+        write_json(staging / "presentation.json", presentation)
+        with (staging / "route_summary.md").open("x", encoding="utf-8") as stream:
+            stream.write(render_route_summary(presentation))
+        for name in ("route.gpx", "route_summary.md"):
+            _copy_new(staging / name, output / name)
+        if plots:
+            from .visualization import create_figures
+            create_figures(graph, route, diagnostics, pois, title=f"{profile.name}; factor={parameters.accessibility_factor:g}",
+                           synthetic=bool(dataset.metadata.get("synthetic", False)), output_dir=output,
+                           file_formats=file_formats, presentation=presentation)
+        manifest["artifact_sha256"] = {path.name: sha256_file(path) for path in sorted(staging.iterdir())}
+        manifest["deliverable_sha256"] = {path.name: sha256_file(path) for path in sorted(output.iterdir()) if path.is_file()}
+        write_json(staging / "manifest.json", manifest)
+        if detailed:
+            details = output / "diagnostics"
+            details.mkdir()
+            for path in sorted(staging.iterdir()):
+                _copy_new(path, details / path.name)
+        # Archive is the completion marker. Exclusive creation never replaces a run.
+        archive_path = output / ARCHIVE_NAME
+        created = False
+        try:
+            with archive_path.open("xb") as stream:
+                created = True
+                with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
+                    for path in sorted(staging.iterdir()):
+                        archive.write(path, arcname=path.name)
+        except BaseException:
+            if created:
+                archive_path.unlink(missing_ok=True)
+            raise
     return manifest
+
+
+def _copy_new(source: Path, destination: Path) -> None:
+    with source.open("rb") as incoming, destination.open("xb") as outgoing:
+        shutil.copyfileobj(incoming, outgoing)
+
+
+def _validate_hashes(hashes: object, required: frozenset[str]) -> dict:
+    if not isinstance(hashes, dict) or not required.issubset(hashes):
+        raise DataError("Saved manifest is missing required artifact checksums")
+    for name, expected in hashes.items():
+        if not re_safe_name(name) or not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise DataError("Invalid artifact name or checksum")
+    return hashes
+
+
+def _read_saved_inputs(root: Path) -> tuple[dict, dict]:
+    standalone = root.is_file()
+    archive_path = root if standalone else root / ARCHIVE_NAME
+    if archive_path.is_file():
+        if archive_path.is_symlink():
+            raise DataError("Research archive cannot be a symbolic link")
+        with ZipFile(archive_path) as archive:
+            entries = archive.infolist()
+            names = [entry.filename for entry in entries]
+            if len(names) != len(set(names)) or set(names) != ARCHIVE_ARTIFACTS | {"manifest.json"}:
+                raise DataError("Archive has missing, duplicate or unexpected members")
+            if any(entry.flag_bits & 1 or entry.file_size > 1024**3 for entry in entries) or sum(
+                entry.file_size for entry in entries
+            ) > 2 * 1024**3:
+                raise DataError("Encrypted or excessively large research archive")
+            manifest = json.loads(archive.read("manifest.json"))
+            if manifest.get("format_version") != 2:
+                raise DataError("Unsupported compact archive version")
+            hashes = _validate_hashes(manifest["artifact_sha256"], ARCHIVE_ARTIFACTS)
+            if set(hashes) != ARCHIVE_ARTIFACTS:
+                raise DataError("Unexpected archived artifact declaration")
+            for name, expected in hashes.items():
+                digest = hashlib.sha256()
+                with archive.open(name) as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                if digest.hexdigest() != expected:
+                    raise DataError("An archived artifact checksum changed")
+            raw = json.loads(archive.read("dataset.json"))
+            if json.loads(archive.read("presentation.json")) != manifest["presentation"]:
+                raise DataError("Archived route presentation differs from its manifest")
+            deliverables = _validate_hashes(manifest["deliverable_sha256"], frozenset({"route.gpx", "route_summary.md"}))
+            if not standalone:
+                for name, expected in deliverables.items():
+                    path = root / name
+                    if path.is_symlink() or not path.is_file() or sha256_file(path) != expected:
+                        raise DataError("A visible result file is missing or its checksum changed")
+        return manifest, raw
+    # Legacy 0.1 results remain readable after verifying their known scientific core.
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("format_version") != 1:
+        raise DataError("Unsupported saved run version or missing completion archive")
+    hashes = _validate_hashes(manifest["artifact_sha256"], REQUIRED_ARTIFACTS)
+    for name, expected in hashes.items():
+        path = root / name
+        if path.is_symlink() or not path.is_file() or sha256_file(path) != expected:
+            raise DataError("A recorded artifact is missing or its checksum changed")
+    return manifest, json.loads((root / "dataset.json").read_text(encoding="utf-8"))
 
 
 def load_run(run_dir: str | Path):
     root = Path(run_dir)
     try:
-        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-        raw = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
-        if manifest["format_version"] != 1 or raw["format_version"] != 1 or manifest["model_version"] != MODEL_VERSION:
+        manifest, raw = _read_saved_inputs(root)
+        if raw["format_version"] != 1 or manifest["model_version"] != MODEL_VERSION:
             raise DataError("Unsupported saved run or scoring-model version")
-        if manifest["environment"]["implementation_sha256"] != implementation_fingerprint():
-            raise DataError("Implementation differs from the recorded run; use the recorded revision to reproduce it")
-        hashes = manifest["artifact_sha256"]
-        if not isinstance(hashes, dict) or not REQUIRED_ARTIFACTS.issubset(hashes):
-            raise DataError("Saved manifest is missing required artifact checksums")
-        for name, expected in hashes.items():
-            if (not re_safe_name(name) or not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected)
-                    or not (root / name).is_file() or (root / name).is_symlink() or sha256_file(root / name) != expected):
-                raise DataError("A recorded artifact is missing or its checksum changed")
+        recorded_core = manifest["environment"].get("scientific_sha256")
+        if recorded_core is None:
+            recorded_core = LEGACY_IMPLEMENTATIONS.get(manifest["environment"]["implementation_sha256"])
+        if recorded_core != scientific_fingerprint():
+            raise DataError("Scientific implementation differs from the recorded run; use the recorded revision")
         dataset = Dataset.from_elements(raw["elements"], raw["metadata"])
         if dataset.fingerprint() != manifest["dataset"]["sha256"] or dataset.counts() != manifest["dataset"]["counts"]:
             raise DataError("Saved input fingerprint mismatch")
@@ -185,7 +311,7 @@ def load_run(run_dir: str | Path):
         return dataset, graph, route, evaluator, manifest
     except DataError:
         raise
-    except (OSError, ValueError, KeyError, IndexError, TypeError):
+    except (OSError, ValueError, KeyError, IndexError, TypeError, BadZipFile):
         raise DataError("Cannot read a complete, valid saved research run") from None
 
 
@@ -193,14 +319,28 @@ def re_safe_name(name: str) -> bool:
     return isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is not None
 
 
-def replot(run_dir: str | Path, output_dir: str | Path, file_formats: tuple[str, ...] = ("png", "pdf")) -> list[Path]:
+def replot(run_dir: str | Path, output_dir: str | Path, file_formats: tuple[str, ...] = ("png",), *,
+           presentation_options: PresentationOptions | None = None,
+           presentation_overrides: dict | None = None) -> list[Path]:
     from .visualization import create_figures
-    dataset, graph, route, evaluator, _ = load_run(run_dir)
+    dataset, graph, route, evaluator, manifest = load_run(run_dir)
+    if presentation_options is not None and presentation_overrides:
+        raise DataError("Provide full presentation options or partial overrides, not both")
+    options = presentation_options or PresentationOptions.from_dict(
+        manifest.get("output", {}).get("options", {}) | (presentation_overrides or {})
+    )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=False)
     diagnostics = edge_diagnostics(graph, route, evaluator)
+    presentation = build_route_presentation(
+        graph, route, diagnostics, evaluator.profile, evaluator.parameters, options=options,
+        baselines=manifest["baselines"], snapping=manifest["snapping"], synthetic=bool(dataset.metadata.get("synthetic", False)),
+    )
+    with (output / "route_summary.md").open("x", encoding="utf-8") as stream:
+        stream.write(render_route_summary(presentation))
     return create_figures(graph, route, diagnostics, collect_pois(graph, route, diagnostics), title=evaluator.profile.name,
-                          synthetic=bool(dataset.metadata.get("synthetic", False)), output_dir=output, file_formats=file_formats)
+                          synthetic=bool(dataset.metadata.get("synthetic", False)), output_dir=output,
+                          file_formats=file_formats, presentation=presentation)
 
 
 def parameter_sweep(run_dir: str | Path, output_dir: str | Path, factors: list[float], unknown_risks: list[float], repeats: int = 3) -> dict:
